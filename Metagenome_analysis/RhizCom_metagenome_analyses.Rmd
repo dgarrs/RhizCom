@@ -1,0 +1,2373 @@
+---
+title: "RhizCom Metagenome Analyses"
+author: "Daniel Garrido-Sanz (daniel.garridosanz@unil.ch)"
+affiliation: "Kell Lab | Department of fundamental microbiology | University of Lausanne"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::html_clean:
+    code_folding: hide
+    toc: true
+    thumbnails: false
+    toc_depth: 3
+pkgdown:
+  as_is: true
+---
+
+For clarity, in the following script **[SN]** refers to the specific **sample reads prefix**.
+We have 9 samples that represent the following: 
+· SbRB1 - Seed-borne rhizospheric bacteria, replicate 1 (reads prefix: WE1_)
+· SbRB2 - Seed-borne rhizospheric bacteria, replicate 2 (reads prefix: WE3_)
+· SbRB3 - Seed-borne rhizospheric bacteria, replicate 3 (reads prefix: WE4_)
+· RhizCom1 - 6th cycle (RhizCom), replicate 1 (reads prefix: 6-S16_R1_)
+· RhizCom2 - 6th cycle (RhizCom), replicate 2 (reads prefix: 6-S16_R2_)
+· RhizCom3 - 6th cycle (RhizCom), replicate 3 (reads prefix: 6-S16_R3_)
+· Soil1 - Soil, replicate 1 (reads prefix: S16_1_)
+· Soil2 - Soil, replicate 2 (reads prefix: S16_2_)
+· Soil3 - Soil, replicate 3 (reads prefix: S16_6_)
+
+# 0. Load packages
+
+```{r}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggplotify)
+library(ggpubr)
+library(Nonpareil)
+library(ggsci)
+library(pals)
+library(scales)
+#library(phangorn)
+library(seqinr)
+library(ggtree)
+library("ggtreeExtra")
+library(ggnewscale)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(SQMtools) #if (!require("BiocManager", quietly = TRUE)) { install.packages("BiocManager")}; BiocManager::install("SQMtools")
+library(vegan)
+library(DESeq2)
+library(ggtern)
+library(scico)
+library(KEGGREST)
+library(pathview)
+library(circlize)
+library(RColorBrewer)
+```
+
+# 1 Fastp - remove adaptors and quality triming.
+
+For each read pair:
+
+```{bash, cache=F}
+fastp -i [SN]_L001_R1.fastq.gz \
+      -I [SN]_L001_R2.fastq.gz \
+      -o [SN]_L001_R1_paired.fq.gz \
+      -O [SN]_L001_R2_paired.fq.gz \
+      --detect_adapter_for_pe \
+      -g -l 70 -w 42 \
+      -h [SN]_L001_report.html
+```
+
+# 2 Concatenate lanes
+
+We have reads sequenced in multiple lanes (L001, L002...). We will combine them into a single file. For each forward or reverse read:
+
+```{bash, cache=F}
+cat [SN]_L00*_R1_paired.fq.gz > [SN]_R1_paired.fqz
+cat [SN]_L00*_R2_paired.fq.gz > [SN]_R2_paired.fqz
+```
+
+# 3 Remove wheat contamination
+
+As samples come from a wheat rhizosphere environment, is very likely that part of the reads belongs to the host (wheat). We will remove reads that belongs to the host by following the protocol in: <https://www.metagenomics.wiki/tools/short-read/remove-host-sequences>
+
+First, download and uncompress the genome of T. aestivum var. Arina from: <https://www.ncbi.nlm.nih.gov/biosample/SAMEA7089054>
+
+Second, build the index with bowtie2
+
+```{bash, cache=F, eval=F}
+bowtie2-build GENOME.fasta wheat_db
+```
+
+Finally, per each set of paired reads follow these commands:
+
+```{bash, cache=F, eval=F}
+# Map reads against the wheat genome database
+bowtie2 -p 44 -x path_to/wheat_db \
+        -1 [SN]_R1_paired.fq.gz \
+        -2 [SN]_R2_paired.fq.gz \
+        -S [SN]_map.sam
+
+# Convert to BAM using samtools
+samtools view -@ 44 -bS [SN]_map.sam > [SN]_map.bam
+
+# Retain unmapped reads
+samtools view -@ 44 -b -f 12 -F 256 [SN]_map.bam > [SN]_UnmappedReads.bam
+
+# Sort bam
+samtools sort -n -m 50G -@ 2 [SN]_UnmappedReads.bam -o [SN]_UnmappedReads_sorted.bam
+
+# Split into the forward and reverse fastq reads
+samtools fastq -@ 44 [SN]_UnmappedReads_sorted.bam \
+               -1 [SN]_nohost_R1.fq.gz -2 [SN]_nohost_R2.fq.gz \ 
+               -n -0 [SN]_nohost_NULL.fq.gz -s [SN]_nohost_SINGLETONS.fq.gz
+
+# Remove temporary and undesired outputs
+rm [SN]_map.sam [SN]_map.bam [SN]_UnmappedReads.bam 
+   [SN]_UnmappedReads_sorted.bam [SN]_nohost_NULL.fq.gz 
+   [SN]_nohost_SINGLETONS.fq.gz
+
+#Repeat for each of the read pairs
+```
+
+From the output of the mapping, we have the following stats of reads that mapped: 
+· SbRB1 - 28.03% 
+· SbRB2 - 24.59% 
+· SbRB3 - 22.16% 
+· RhizCom1 - 5.32% 
+· RhizCom2 - 13.59% 
+· RhizCom3 - 11.51% 
+· Soil1 - 0.01% 
+· Soil2 - 0.01% 
+· Soil3 - 0.01%
+
+**Note: These reads are the ones that we will use later on to map back to the assembly to calculate abundance of genes and taxa!**
+
+# 4 Downsample
+
+To account for computational limitations, RhizCom and Soil samples are gonna be downsampled to a max. of 600.000.000 reads per paired read file.
+
+```{bash, cache=F, eval=F}
+#use same seed (-s) to keep them paired
+seqkit sample -s 123 -p 0.75 [SN]_nohost_R1.fq.gz | seqkit head -j 46 -n 300000000 -o [SN]_nohost_dw_R1.fq.gz
+seqkit sample -s 123 -p 0.75 [SN]_nohost_R2.fq.gz | seqkit head -j 46 -n 300000000 -o [SN]_nohost_dw_R2.fq.gz
+#repeat for each sample/replicate
+```
+
+# 5 Normalization
+
+We are gonna normalize by k-mer coverage to facilitate the assembly.
+We will have individuals in the community whose genomes are highly represented and other not so much. A k-mer coverage of 40-50 is more than enough to properly assembly good quality contigs. Similarly, below a k-mer coverage of 10-5 assemblies not very well supported. In addition, another important factor to consider is that we have replicates (3 per metagenome) and we are going to coassembly of all replicates and samples together to maximize the recovery of contigs. Therefore, we are gonna combine all reads from the replicates into a single file (one per sister read) and use that to normalize with BBnorm. We will retain reads with a k-mer coverage between 5-50 per concatenated read paired files.
+
+This is quite memory consuming as all reads need to be stored in memory. To achieve this, we will do two passes: 
+· First per sample using 50-0 as the thresholds.
+· Then concatenate per sample
+· Finally the last pass using 50-5 as the threshold
+
+## 5.1 First pass: 50 - 0 per sample
+
+```{bash, cache=F, eval=F}
+#conda activate bbtools
+bbnorm.sh -Xmx120g in1=[SN]_nohost_R1.fq.gz \
+                   in2=[SN]_nohost_R2.fq.gz \
+                   out1=03_BBnorm_firstpass_50-0/[SN]_norm.fq.gz \
+                   out2=03_BBnorm_firstpass_50-0/[SN]_norm.fq.gz \
+                   threads=44 \ 
+                   tmpdir=/mnt/e/tmp/ \ 
+                   target=50 mindepth=0 \ 
+                   hist=03_BBnorm_firstpass_50-0/[SN]_hist.hist \
+                   peaks=03_BBnorm_firstpass_50-0/[SN]_peaks.peaks \ 
+                   &> 03_BBnorm_firstpass_50-0/[SN]_norm.log
+```
+
+## 5.2 Concatenate per sample and sister read
+
+```{bash, cache=F, eval=F}
+#Forward reads
+cat [SN]*_R1_norm.fq.gz > [SN]_R1_norm1.fq.gz
+
+#Reverse reads
+cat [SN]*_R2_norm.fq.gz > [SN]_R2_norm1.fq.gz
+```
+
+## 5.3 Second pass: 50 - 5
+
+```{bash, cache=F, eval=F}
+bbnorm.sh -Xmx120g in1=[SN]_R1_norm1.fq.gz \    
+                   in2=[SN]_R2_norm1.fq.gz \
+                   out1=05_BBnorm_secondpass_50-5/[SN]_R1_norm.fq.gz \
+                   out2=05_BBnorm_secondpass_50-5/[SN]_R2_norm.fq.gz \
+                   threads=44 \
+                   tmpdir=/mnt/e/tmp/ \
+                   target=50 \
+                   mindepth=5 \
+                   hist=05_BBnorm_secondpass_50-5/[SN]_hist.hist \
+                   peaks=05_BBnorm_secondpass_50-5/[SN]_peaks.peaks \
+                   &> 05_BBnorm_secondpass_50-5/[SN]_norm.log
+
+```
+
+## 5.4 Binning Soil samples:
+
+In the case of the soil samples, given their high sequence diversity we are gonna bin reads based on k-mer coverage, using the thresholds of 40 and 15.
+· Reads with more than 40 k-mer coverage will be saved in the high-coverage bin.
+· Reads between 40 - 15 k-mer coverage will be saved in the mid-coverage bin.
+· Reads with a coverage below 15 will be saved in the low-coverage bin. Bin of reads with a k-mer coverage below 15 wont be assembled == discarded!
+
+```{bash, cache=F, eval=F}
+bbnorm.sh -Xmx180g in1=[SN]_R1_norm.fq.gz \
+                   in2=[SN]_R2_norm.fq.gz \
+                   outlow1=[SN]_R1_binnLOW.fq.gz \
+                   outlow2=[SN]_R2_binnLOW.fq.gz \
+                   outmid1=[SN]_R1_binnMID.fq.gz \
+                   outmid2=[SN]_R2_binnMID.fq.gz \
+                   outhigh1=[SN]_R1_binnHIGH.fq.gz \
+                   outhigh2=[SN]_R2_binnHIGH.fq.gz \
+                   threads=44 \
+                   tmpdir=/mnt/e/tmp/ \
+                   passes=1 \
+                   lowbindepth=15 \
+                   highbindepth=40 \
+                   mindepth=0 \
+                   &> [SN]_binn.log
+
+```
+
+
+# 6 Track read numbers
+
+So far, we have generated reads in five steps: 
+· Raw reads 
+· Fastp 
+· [Concatenated] 
+· Host removal 
+· BBnorm pass 1 
+· [Concatenated] 
+· BBnorm pass 2 
+· BBnorm binning for soil samples.
+
+For each of these, we are going to calculate how many reads we have using seqkit with the following command:
+
+```{bash, eval=F, cache=F}
+#Basic command line usage
+seqkit stats -b -T -j 46 file_with_reads &> Track_reads_through_pipeline.txt
+#repeat per read file.
+```
+
+## 6.1 Plot reads stats
+
+We can use this information to plot the number of surviving reads across the pipeline
+
+```{r}
+track_reads = read.table("Track_Reads.txt", header = T, sep = "\t")
+#Sum forward and reverse reads
+tracksum = track_reads %>% group_by(step, sample, order) %>% summarise(sumSeqs=sum(num_seqs),
+                                                                sumLeng=sum(sum_len))
+head(tracksum)
+
+options(scipen = 999)
+ggplot(tracksum, aes(x=reorder(sample, order), y=sumSeqs)) +
+  geom_bar(stat = "identity", aes(fill=sample)) + 
+  ylab("Number of reads (frw. + rev.)") +
+  xlab("Sample")+
+  scale_y_continuous(labels=scales::label_number(),
+                     breaks = (c(0, 500000000, 1000000000, 1500000000, 2000000000)))+
+  scale_fill_manual(values=c(rep("#00A087",4), rep("#AF8080", 7), rep("#CEA241", 4)))+
+  geom_hline(yintercept = 600000000, color="red")+
+  geom_text(aes(label=sumSeqs), position=position_dodge(width=0.9), 
+            size=2.5, angle=90, hjust=-0.1, vjust=0.5)+
+  facet_wrap(~step, scales = "free_x", nrow = 1) +
+  theme_pubclean() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+                          legend.position = "bottom")
+
+```
+
+Reads after normalization and binning will only be used for coassembly.
+
+# 7 Nonpareil
+
+A measure of the sample coverage based on reads can be achieved using Nonpareil3. We only want this information from the **reads after host removal**, as these are the reads used for mapping back against the assemble.
+
+```{bash, evail=F, chache=F}
+#per fastq.gz file containing ONLY forward reads:
+#first, uncompress the file
+pigz -b 512 -p 46 -dc [SN]_R1_nohost.fq.gz > [SN]_R1_nohost-Np.fq
+
+#then, execute nonpareil
+nonpareil -s [SN]_R1_nohost-Np.fq \
+          -T kmer \
+          -f fastq \
+          -t 46 \
+          -R 40960 \
+          -X 100000 \ #number of random sequences to pick
+          -k 31 \
+          -b []_R1_norm
+```
+
+This generates a series of files, including the ".npo" which is required for ploting the nonpareil curves.
+
+Generate the samples_nonpareil.txt files containing the following information (tab-separated columns)
+· File: path to the .npo file.
+· Name: Sample name
+· Col: RGB color of the form "#00A087" (with quotations marks).
+
+## 7.1 Nonpareil curves
+
+```{r}
+#load the sample file
+np_samples = read.table("../Nonpareil_v3/samples_nonpareil.txt", sep="\t", header = T, as.is=T)
+head(np_samples)
+```
+
+```{r}
+#attach(np_samples)
+nps = Nonpareil.set(np_samples$File, 
+                    labels=np_samples$Name, 
+                    col = np_samples$Col,
+                    plot.opts=list(plot.observed=F, plot.diversity = F,
+                                    plot.dispersion = F, legend="topright", log="x"))
+
+#to obtain the data
+summary(nps)
+#and write results
+write.table(as.data.frame(summary(nps)), "nonpareil_results.txt", quote = F, sep = "\t")
+```
+
+
+# 8 Coassembly
+
+We now assembly all samples together using MEGAHIT. Samples are SbRB, RhizCom, Soil (binHigh) and Soil (binMid)
+
+```{bash, cache=F, eval=F}
+megahit -o Megahit_ALL_CoA \
+        --out-prefix ALL_CoA \
+        --min-contig-len 500 \
+        --presets meta-large \
+        --kmin-1pass \
+        --tmp-dir /tmp/ \
+        -t 46 \
+        -1 SbRB_R1_norm.fq.gz,RhizCom_R1_norm.fq.gz,Soil_R1_binnHIGH.fq.gz,Soil_R1_binnMID.fq.gz \
+        -2 SbRB_R2_norm.fq.gz,RhizCom_R2_norm.fq.gz,Soil_R2_binnHIGH.fq.gz,Soil_R2_binnMID.fq.gz
+```
+
+## 8.1 Evaluate assemblies
+
+We are going to evaluate the assembles using QUAST:
+
+```{bash, cache=F, eval=F}
+quast -o ALL_CoA_QUAST \
+      --contig-thresholds 0,500,1000,2000,5000,10000,50000,100000 \
+      --threads 42 \
+      --min-contig 0 \
+      ALL_CoA.contigs.fa
+```
+
+## 8.2 Sort, filter and rename contigs
+
+Sort contigs by size, rename as N (where N is the number of the contig ordered from largest to smalest) and filter out those < 1000 bp
+
+```{bash, cache=F, eval=F}
+seqkit sort -l -r ALL_CoA.contigs.fa -j 44 | 
+            seqkit seq -j 44 -m 1000 | 
+            seqkit replace -p ".+" -r "(.*)_{nr}" -j 44 -o ALL_CoA_renamed.fasta
+```
+
+## 8.3 Track contigs
+
+Obtain stats from QUAST and represent
+
+```{r}
+ctg_stats = read.table("Contigs_stats.txt", header = T, sep = "\t")
+#remove unnecessary info:
+ctg_stats = ctg_stats %>% filter(Param!= "N50" & Param != "N90" & 
+                Param != "auN" & Param != "L50" & Param != "L90" & Param != "Cgperc") %>% filter(Stats != 500)
+head(ctg_stats)
+
+ctg = ggplot(filter(ctg_stats, Param == "contigs"), aes(x=reorder(Stats, order), y=value, fill=Sample))+
+  geom_bar(stat = "identity")+
+  geom_text(aes(label=value), position=position_dodge(width=0.9), 
+            size=2.5, angle=90, hjust=-0.1, vjust=0.5)+
+  scale_y_continuous(labels=scales::label_number_si())+
+  xlab("")+ylab("Number")+
+  facet_wrap(~Sample, nrow = 1) +
+  theme_pubclean() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+                          legend.position = "bottom")
+
+leng =ggplot(filter(ctg_stats, Param == "legnth"), aes(x=reorder(Stats, order), y=value, fill=Sample))+
+  geom_bar(stat = "identity")+
+  geom_text(aes(label=value), position=position_dodge(width=0.9), 
+            size=2.5, angle=90, hjust=-0.1, vjust=0.5)+
+  scale_y_continuous(labels=scales::label_number_si())+
+  xlab("")+ylab("Number")+
+  facet_wrap(~Sample, nrow = 1) +
+  theme_pubclean() +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+                          legend.position = "bottom")
+
+ggarrange(ctg, 
+          leng, nrow = 2, 
+          labels = "AUTO", align = "hv", common.legend = T, legend = "bottom")
+```
+
+
+# 9 SqueezeMeta
+
+Contigs are going to be processed using SqueezeMeta pipeline (https://github.com/jtamames/SqueezeMeta) for annotation, calculation of gene abundances, etc.
+
+```{bash, cache=F, eval=F}
+SqueezeMeta.pl -m coassembly \
+               -p RhizCom \
+               -s sample_table_SQM.txt \
+               -f .../02_READS_filt_nohost/ \
+               -extassembly ALL_CoA_renamed.fasta \
+               -taxbinmode s \
+               -binners cococt,metabat2,maxbin
+               -t 46
+
+```
+
+The reads used for maping are those after host removal, and before downsample and normalization.
+
+## 9.1 Load SQM Results
+
+```{r message=FALSE, warning=FALSE}
+#In R version 4.4.1 SQMtools doest work. 
+#It works in version 4.1.1, but... KEGGREST doesn't work in that verion...
+#Solution: Using R v4.1.1 export the loadSQM object as RDS object and then load it again in R v4.4.1
+
+#RhizCom = loadSQM("RhizCom.zip", engine = "data.table")
+#saveRDS(RhizCom, "RhizCom.rds")
+
+RhizCom = readRDS("RhizCom.rds")
+```
+
+**Note:** SbRB samples were originally named as "STB".
+
+# 10 Abundance of taxa
+
+```{r}
+tax_ska = plotTaxonomy(RhizCom, rank="superkingdom", count="abund", nocds = "treat_as_unclassified") +
+  theme_pubclean() + xlab("Number of reads") 
+
+
+tax_pha = plotTaxonomy(RhizCom, rank="phylum", count="abund", N=12, nocds = "treat_as_unclassified")
+tax_pha = tax_pha + theme_pubclean() + xlab("Number of reads") + 
+  scale_fill_manual(values=c("black", ocean.deep(10), "grey80", "grey50"))
+
+tax_phra = plotTaxonomy(RhizCom, rank="phylum", count="percent", N=12, nocds = "treat_as_unclassified")
+tax_phra = tax_phra + theme_pubclean() + 
+  scale_fill_manual(values=c("black", ocean.deep(10), "grey80", "grey50"))
+
+ggarrange(tax_ska, tax_pha, tax_phra, ncol = 3, labels = c("a", "b", "c"), align = "hv", legend = "right")
+rm(tax_ska, tax_pha, tax_phra)
+```
+
+# 11 General functional differences
+
+Before entering in more details, it would be nice to see if there'are functional differences between the samples, and if the replicates cluster together according to these functions. This can be done using PCoA based on KEGGs TPMs.
+
+## 11.1 PCoA
+
+```{r}
+#PCoA based on KEGG functions and TPMs
+kegg_tpm = t(RhizCom$functions$KEGG$tpm)
+set.seed(12345)
+kegg_tpm.bray = vegdist(kegg_tpm, method = "bray")
+kegg_tpm.pco = ape::pcoa(kegg_tpm.bray)
+
+scrs.bray = as.data.frame(kegg_tpm.pco$vectors)
+scrs.bray = scrs.bray %>% select(Axis.1, Axis.2) %>% rownames_to_column(var="samples")
+scrs.bray$samp = c("STB", "STB", "STB", "RhizCom", "RhizCom", "RhizCom", "Soil", "Soil", "Soil")
+
+cen.bray = aggregate(cbind(Axis.1, Axis.2) ~ samp, data = scrs.bray, FUN = mean)
+segs.bray = merge(scrs.bray, setNames(cen.bray, c('samp', 'oAxis1','oAxis2')),
+              by = 'samp', sort = FALSE)
+
+
+ggplot(scrs.bray, aes(x=Axis.1, y=Axis.2, color=samp))+ geom_point(alpha=0.1) +
+  geom_segment(data = segs.bray, mapping = aes(xend = oAxis1, yend = oAxis2), size=0.5, alpha=0.25) +
+  geom_point(data = cen.bray, size = 2) +
+  ggtitle("PCoA KEGG TPMs")+
+  xlab(paste0("PcoA1 (", round(kegg_tpm.pco$values$Broken_stick[1]*100, digits = 2),"%)",sep=""))+
+  ylab(paste0("PcoA2 (", round(kegg_tpm.pco$values$Broken_stick[2]*100, digits = 2),"%)",sep=""))+
+  geom_hline(yintercept = 0, linetype="dashed", color="grey") +
+  geom_vline(xintercept = 0, linetype="dashed", color="grey") +
+  scale_color_manual(values=c("#2e7272", "#af8080", "#cea241"))+
+  ggrepel::geom_text_repel(data = cen.bray, label=cen.bray$samp, force = 2)+
+  theme_classic2()
+```
+Test statistical differences between groups:
+
+```{r}
+Groups = colnames(as.matrix(kegg_tpm.bray)) %>% str_replace("[1-3]", "")
+
+set.seed(123)
+#test for normal distribution:
+shapiro.test(as.dist(kegg_tpm.bray))
+#P is significant; not normally distributed == ANOSIM
+
+#adonis(kegg_tpm.bray ~ Groups)$aov.tab
+anosim(kegg_tpm.bray, Groups)
+```
+
+## 11.2 Clustering by functions
+
+Clustering of samples based on KEGG functions(Brite hierarchies)
+
+```{r}
+kegg_paths = as.data.frame(RhizCom$misc$KEGG_paths) %>% rownames_to_column("KEGG_ID")
+colnames(kegg_paths) = c("KEGG_ID", "KEGG_PATH")
+
+kegg_paths.tpm = as.data.frame(RhizCom$functions$KEGG$tpm) %>% 
+  rownames_to_column("KEGG_ID") %>% 
+  left_join(kegg_paths, by = c("KEGG_ID"))
+
+n_distinct(kegg_paths.tpm$KEGG_PATH)
+
+
+#Dealing with multiple annotations per gene.
+#We are going to separate rows by these multiple functions, as they indicate that a protein participate in several relevant biological processes.
+kegg_paths.tpm = kegg_paths.tpm %>% separate_rows(KEGG_PATH, sep="\\s*\\|\\s*")
+
+#Remove Huamn diseases and organisimal systems (does not apply to our dataset) and sanity check
+kegg_paths.tpm = kegg_paths.tpm %>% filter(!str_detect(KEGG_PATH, "Human Diseases") & 
+                                             !str_detect(KEGG_PATH, "Organismal Systems") &
+                                             !str_detect(KEGG_PATH, "path not available"))
+kegg_paths.tpm$KEGG_PATH = base::sub(" $", "", kegg_paths.tpm$KEGG_PATH) #sanity check
+kegg_paths.tpm$KEGG_PATH = base::sub("^ ", "", kegg_paths.tpm$KEGG_PATH) #sanity check
+n_distinct(kegg_paths.tpm$KEGG_PATH)
+```
+
+
+```{r}
+TPMthresh = 1000
+kegg_paths.tpm_filt = kegg_paths.tpm %>% filter(rowSums(across(where(is.numeric))) >= TPMthresh) %>%
+  reshape2::melt()
+
+#sum values if KEGG_PATH is the same
+kegg_paths.tpm_filt = kegg_paths.tpm_filt %>% select(-KEGG_ID) %>% group_by(KEGG_PATH, variable) %>%
+  summarise(value = sum(value))
+
+#Filter functions not annotated:
+kegg_paths.tpm_filt = kegg_paths.tpm_filt %>% 
+  filter(!grepl("Unclassified", KEGG_PATH) &
+           !grepl("(.*)path not available\\)$", KEGG_PATH))
+
+spred = as.data.frame(spread(kegg_paths.tpm_filt, key = KEGG_PATH, value = value))
+spred = column_to_rownames(spred, var = "variable") %>% t()
+#log transform
+spred = log10(spred)
+
+
+set.seed(1234)
+Heatmap(spred, name="log10(TPMs)", 
+        col = rev(ocean.ice(50)), 
+        cluster_rows = F,
+        column_dend_side = "top", column_names_side = "top", column_km = 3,
+        column_title = paste0("TPMs >= ", TPMthresh),
+        width = ncol(spred)*unit(4, "mm"), height = unit(12, "cm"), 
+        column_names_gp = grid::gpar(fontsize = 6), row_names_gp = grid::gpar(fontsize= 6))
+```
+
+# 11 MAGs
+
+## 11.1 MAG stats
+
+First, lets explore the bins results:
+
+```{r}
+bins = RhizCom$bins$table
+#add rownames as column Bin.ID
+bins = rownames_to_column(bins, "Bin.ID")
+
+#add the Quality index
+bins$Quality = ifelse(bins$Completeness > 90 & bins$Contamination < 5, "1_High-quality",
+                      ifelse(bins$Completeness > 75 & bins$Contamination < 10, "2_Good-quality",
+                             ifelse(bins$Completeness > 50 & bins$Contamination < 10, "3_Medium-quality", 
+                                    ifelse(bins$Completeness <= 50 & bins$Contamination < 10, "4_Low-quality", "Discarded"))))
+
+#Plot copleteness vs. contamination
+ggplot(bins, aes(x=log10(Contamination), y = Completeness, color=Quality))+
+  geom_point(shape=16)+
+  xlab("log10(Contamination (%))") + ylab("Completeness (%)")+
+  geom_hline(yintercept = c(90, 75, 50), linetype= "dashed", color = "grey60")+
+  geom_vline(xintercept = c(log10(5), log10(10)), linetype= "dashed", color = "grey60")+
+  scale_color_manual(values= c("#36164C", "#764A93", "#5B6291", "#90A0B7", "#BCBCBC"))+
+  scale_y_continuous(breaks = c(0, 25, 50, 75, 90,100))+
+  theme_pubr() + theme(legend.position = "right")+
+  coord_flip()
+```
+
+
+Count and represent the high quality, medium and low quality bins based on standard metrics: <https://www.nature.com/articles/nbt.3893>
+
+```{r}
+print("High-quality MAGS: > 90% completeness, < 5% contamination")
+filter(bins, Quality == "1_High-quality") %>% nrow()
+print("Good-quality MAGS: >  75% completeness, < 10% contamination")
+filter(bins, Quality == "2_Good-quality") %>% nrow()
+print("Medium-quality MAGS: > 50% completeness, < 10% contamination")
+filter(bins, Quality == "3_Medium-quality") %>% nrow()
+print("Low-quality MAGS: <= 50% completeness, < 10% contamination")
+filter(bins, Quality == "4_Low-quality") %>% nrow()
+print("Discarded MAGS: >= 10% contamination")
+filter(bins, Quality == "Discarded") %>% nrow()
+print("Total")
+nrow(bins)
+
+bins_doughnut = data.frame(Quality = c("High-quality","Good-quality", "Medium-quality", "Low-quality", "Discarded"),
+                           Number = c(filter(bins, Quality == "1_High-quality") %>% nrow(),
+                                      filter(bins, Quality == "2_Good-quality") %>% nrow(),
+                                      filter(bins, Quality == "3_Medium-quality") %>% nrow(),
+                                      filter(bins, Quality == "4_Low-quality") %>% nrow(),
+                                      filter(bins, Quality == "Discarded") %>% nrow()))
+
+#percentages:
+bins_doughnut$Frac = bins_doughnut$Number / sum(bins_doughnut$Number)
+# Compute the cumulative percentages (top of each rectangle)
+bins_doughnut$ymax <- cumsum(bins_doughnut$Frac)
+
+# Compute the bottom of each rectangle
+bins_doughnut$ymin <- c(0, head(bins_doughnut$ymax, n=-1))
+# Compute label position
+bins_doughnut$labelPosition <- (bins_doughnut$ymax + bins_doughnut$ymin) / 2
+
+# Compute a good label
+bins_doughnut$label <- paste0(bins_doughnut$Quality, "\n value: ", bins_doughnut$Number)
+
+ggplot(bins_doughnut, aes(ymax=ymax, ymin=ymin, xmax=3.5, xmin=2.8, fill=Quality))+
+  geom_rect()+
+  geom_text( x=4, aes(y=labelPosition, label=label, color=Quality), size=3) +
+  scale_fill_manual(values= c("#BCBCBC", "#764A93", "#36164C", "#90A0B7", "#5B6291")) +
+  scale_color_manual(values= c("#BCBCBC", "#764A93", "#36164C", "#90A0B7", "#5B6291")) +
+  coord_polar(theta="y") +
+  xlim(c(2, 4)) +
+  theme_void() +
+  theme(legend.position = "none")
+```
+
+
+## 11.2 Phylogeny of medium to good Mags
+
+Write the FASTA files (nucleotides) of the high - medium quality MAGs into a folder.
+
+
+```{r, eval=F}
+mags = filter(bins, Quality != "Discarded" & Quality != "4_Low-quality")
+goodmags_filenames = paste0("../RhizComv3_SQMresults/bins/", mags$Bin.ID, ".fa")
+
+file.copy(from=goodmags_filenames, to="../RhizComv3_SQMresults/GoodMags/", 
+          overwrite = F, recursive = FALSE, 
+          copy.mode = TRUE)
+
+```
+
+Rename the MAGs from 1 to 110 as M001, M002, M003... M110.
+
+PhyloPhlAn3.0
+
+```{bash, eval=F}
+phylophlan -i ../MAG_FNAs \
+    -d phylophlan \
+    --diversity medium \
+    -f supermatrix_aa.cfg \
+    --accurate \
+    --nproc 16
+
+#Repeat RaXML with bootstrap:
+raxmlHPC-PTHREADS-SSE3 -s <your alignment file> -n <your output file> -f a -m PROTCATLG -# 100 -p 1989 -x 1989 -T 20
+```
+
+After phylophlan finishes, Best-scoring ML tree written to: RAxML_bestTree.MAG_FNAs Best-scoring ML tree with support values written to: RAxML_bipartitions.MAG_FNAs
+
+```{r}
+mags_tree = read.tree("../PhyloPhlAn_results/RAxML_bipartitions.MAG_FNAs")
+ggtree(mags_tree) + geom_tiplab(size=3) + geom_nodelab(aes(x=branch), size=2)
+```
+
+## 11.3 Collect MAGs info
+
+```{r}
+mags_info = read.table("MAGS_info.txt", header = T, sep = "\t")
+#add tax
+mags_info = mags_info %>% left_join(bins, by=c("MAG_ID" = "Bin.ID"))
+#separate tax:
+mags_info = mags_info %>% separate(Tax, into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";._")
+mags_info$Kingdom = gsub("k_|;", "", mags_info$Kingdom)
+mags_info$LastTax = ifelse(!is.na(mags_info$Species), mags_info$Species, 
+                           ifelse(!is.na(mags_info$Genus), mags_info$Genus, 
+                                  ifelse(!is.na(mags_info$Family), mags_info$Family,
+                                         ifelse(!is.na(mags_info$Order), mags_info$Order,
+                                                ifelse(!is.na(mags_info$Class), mags_info$Class,
+                                                       ifelse(!is.na(mags_info$Phylum), mags_info$Phylum,
+                                                              ifelse(!is.na(mags_info$Kingdom), mags_info$Kingdom, "NA")))))))
+mags_info$LastTax = gsub(";", "", mags_info$LastTax)
+#rownames(mags_info) = mags_info$MAG_name
+head(mags_info)
+
+
+#BINS info
+bins_info = bins %>% separate(Tax, into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";._")
+bins_info$Kingdom = gsub("k_|;", "", bins_info$Kingdom)
+bins_info$LastTax = ifelse(!is.na(bins_info$Species), bins_info$Species, 
+                           ifelse(!is.na(bins_info$Genus), bins_info$Genus, 
+                                  ifelse(!is.na(bins_info$Family), bins_info$Family,
+                                         ifelse(!is.na(bins_info$Order), bins_info$Order,
+                                                ifelse(!is.na(bins_info$Class), bins_info$Class,
+                                                       ifelse(!is.na(bins_info$Phylum), bins_info$Phylum,
+                                                              ifelse(!is.na(bins_info$Kingdom), bins_info$Kingdom, "NA")))))))
+
+```
+
+Calculate mean values and % of TPMs.
+
+```{r}
+#and calculate mean values and % of TPMs, which indicates the relative abundance:
+mags_info = mags_info %>% mutate(SbRB.TPM_mean = rowMeans(select(., `TPM STB1`, `TPM STB2`, `TPM STB3`)),
+         SbRB.TPM_perc = SbRB.TPM_mean * 100/ sum(1e+06, na.rm = TRUE),
+         RhizCom.TPM_mean = rowMeans(select(., `TPM RhizCom1`, `TPM RhizCom2`, `TPM RhizCom3`)),
+         RhizCom.TPM_perc = RhizCom.TPM_mean * 100/ sum(1e+06, na.rm = TRUE),
+         Soil.TPM_mean = rowMeans(select(., `TPM Soil1`, `TPM Soil2`, `TPM Soil3`)),
+         Soil.TPM_perc = Soil.TPM_mean * 100/ sum(1e+06, na.rm = TRUE))
+
+head(mags_info)
+
+bins_info = bins_info %>% mutate(SbRB.TPM_mean = rowMeans(select(., `TPM STB1`, `TPM STB2`, `TPM STB3`)),
+         SbRB.TPM_perc = SbRB.TPM_mean * 100/ sum(SbRB.TPM_mean, na.rm = TRUE),
+         RhizCom.TPM_mean = rowMeans(select(., `TPM RhizCom1`, `TPM RhizCom2`, `TPM RhizCom3`)),
+         RhizCom.TPM_perc = RhizCom.TPM_mean * 100/ sum(RhizCom.TPM_mean, na.rm = TRUE),
+         Soil.TPM_mean = rowMeans(select(., `TPM Soil1`, `TPM Soil2`, `TPM Soil3`)),
+         Soil.TPM_perc = Soil.TPM_mean * 100/ sum(Soil.TPM_mean, na.rm = TRUE))
+```
+
+Based on this info, assign each MAG to a community: SbRB, RhizCom or Soil. After manually inpecting the data, a good condition of community assignment is applying the following two rules:
+1. If a MAG mean TPM% is ≥ 1.5x that of the other two communities, it belongs to that commnunity. 
+2. If the first condition is not met, the MAG is assigned to communities where the mean TPM percentage difference is < 1.5x. 
+
+
+```{r}
+mags_info = mags_info %>%
+  mutate(Comm_adscription = ifelse(SbRB.TPM_perc >= 1.5 * RhizCom.TPM_perc & SbRB.TPM_perc >= 1.5 * Soil.TPM_perc, "SbRB",
+                                   ifelse(RhizCom.TPM_perc >= 1.5 * SbRB.TPM_perc & RhizCom.TPM_perc >= 1.5 * Soil.TPM_perc, "RhizCom",
+                                          ifelse(Soil.TPM_perc >= 1.5 * SbRB.TPM_perc & Soil.TPM_perc >= 1.5 * RhizCom.TPM_perc, "Soil",
+                                                 ifelse(SbRB.TPM_perc < 1.5 * RhizCom.TPM_perc & SbRB.TPM_perc < 1.5 * Soil.TPM_perc, "RhizCom_and_Soil",
+                                                        ifelse(RhizCom.TPM_perc < 1.5 * SbRB.TPM_perc & RhizCom.TPM_perc < 1.5 * Soil.TPM_perc, "SbRB_and_Soil",
+                                                               ifelse(Soil.TPM_perc < 1.5 * SbRB.TPM_perc & Soil.TPM_perc < 1.5 * RhizCom.TPM_perc, "SbRB_and_RhizCom", "ERROR")))))))
+
+#and also add the comm origin!, which can only be SbRB or Soil!
+mags_info = mags_info %>%
+  mutate(Comm_origin = ifelse(Soil.TPM_perc >= 1.5*SbRB.TPM_perc, "Soil", "SbRB"))
+
+head(mags_info)
+
+# --- BINS
+bins_info = bins_info %>%
+   mutate(Comm_adscription = ifelse(SbRB.TPM_perc >= 1.5 * RhizCom.TPM_perc & SbRB.TPM_perc >= 1.5 * Soil.TPM_perc, "SbRB",
+                                    ifelse(RhizCom.TPM_perc >= 1.5 * SbRB.TPM_perc & RhizCom.TPM_perc >= 1.5 * Soil.TPM_perc, "RhizCom",
+                                           ifelse(Soil.TPM_perc >= 1.5 * SbRB.TPM_perc & Soil.TPM_perc >= 1.5 * RhizCom.TPM_perc, "Soil",
+                                                  ifelse(SbRB.TPM_perc < 1.5 * RhizCom.TPM_perc & SbRB.TPM_perc < 1.5 * Soil.TPM_perc, "RhizCom_and_Soil",
+                                                         ifelse(RhizCom.TPM_perc < 1.5 * SbRB.TPM_perc & RhizCom.TPM_perc < 1.5 * Soil.TPM_perc, "SbRB_and_Soil",
+                                                                ifelse(Soil.TPM_perc < 1.5 * SbRB.TPM_perc & Soil.TPM_perc < 1.5 * RhizCom.TPM_perc, "SbRB_and_RhizCom", "ERROR")))))))
+head(bins_info)
+```
+
+We have only one instance of a MAG assigned to RhizCom and Soil
+
+```{r}
+#Plot how many MAG are assigned to each comm:
+ggplot(mags_info %>% group_by(Comm_adscription, Quality) %>% summarise(count = n(), .groups = 'drop'), 
+       aes(x=Comm_adscription, y=count, fill=Quality))+
+  geom_bar(stat="identity")+
+  ggtitle("MAG's community adscription")+
+  scale_fill_manual(values= c("#36164C", "#764A93", "#5B6291")) +
+  geom_text(aes(label = count), vjust = -0.5)+
+  scale_y_continuous(limits = c(0,60), breaks=c(0,10,20,30,40,50,60))+
+  theme_pubclean()
+
+
+ggplot(bins_info %>% group_by(Comm_adscription, Quality) %>% summarise(count = n(), .groups = 'drop'), 
+       aes(x=Comm_adscription, y=count, fill=Quality))+
+  geom_bar(stat="identity")+
+  ggtitle("Bin's community adscription")+
+  scale_fill_manual(values= c("#36164C", "#764A93", "#5B6291", "#90A0B7", "#BCBCBC")) +
+  geom_text(aes(label = count), vjust = -0.5)+
+  scale_y_continuous(limits = c(0,60), breaks=c(0,10,20,30,40,50,60))+
+  theme_pubclean()
+```
+
+And now we can plot the data we consider along with the tree.
+
+See: <https://bioconductor.org/packages/devel/bioc/vignettes/ggtreeExtra/inst/doc/ggtreeExtra.html> and <https://yulab-smu.top/treedata-book/chapter4.html>
+
+```{r}
+ptr = ggtree(mags_tree) +
+  geom_tiplab(size=3, align = T, linesize = 0.2) + 
+  geom_nodelab(aes(x=branch), size=2) +
+  geom_treescale()
+
+ptr$data = left_join(ptr$data, mags_info, by=c("label" = "MAG_name"))
+head(ptr$data)
+
+
+ptr = ptr + geom_fruit( 
+             geom = geom_tile,
+             mapping = aes(y=MAG_name, x=1, fill=Quality), 
+             offset = 0.75)+ 
+  scale_fill_manual(values = c("#004c1f", "#1f9351", "#739130"),
+                      guide=guide_legend(keywidth = 0.75, 
+                                         keyheight = 0.75, 
+                                         order=1))+
+  new_scale_fill()+
+  geom_fruit(geom = geom_tile,
+             mapping = aes(y=MAG_name, x=1, fill=Completeness))+ 
+  scale_fill_gradient(low="grey80", high="black",
+                      guide=guide_legend(keywidth = 0.75, 
+                                         keyheight = 0.75, 
+                                         order=2))+
+  
+  new_scale_fill()+
+  geom_fruit(geom = geom_tile,
+             mapping = aes(y=MAG_name, x=1, fill=Contamination))+ 
+  scale_fill_gradient(low="white", high="brown",
+                      guide=guide_legend(keywidth = 0.75, 
+                                         keyheight = 0.75, 
+                                         order=3))+
+  new_scale_fill()+
+  
+  geom_fruit(geom = geom_tile,
+             mapping = aes(y=MAG_name, x=1, fill=`Strain het`)) +
+  scale_fill_gradient(low="white", high="blue4",
+                      guide=guide_legend(keywidth = 0.75, 
+                                         keyheight = 0.75, 
+                                         order=4))+
+  
+
+  new_scale_fill()+
+  geom_fruit(geom = geom_tile,
+             mapping = aes(y=MAG_name, x=1, fill=Comm_adscription))+
+  scale_fill_manual(values=c("#2e7272", "grey", "#cea241", "#af8080"),
+                    guide=guide_legend(keywidth = 0.75,
+                                       keyheight = 0.75,
+                                       order = 5))
+
+
+
+ptr = ptr + geom_fruit(geom=geom_text, mapping=aes(label = LastTax),
+             hjust=0, size=2)
+
+glen = ggplot(filter(as.data.frame(ptr$data), !is.na(Length)), aes(y=reorder(label, y), x = Length))+
+  geom_col()+theme_classic()
+
+gcon = ggplot(filter(as.data.frame(ptr$data), !is.na(`Num contigs`)), aes(y=reorder(label, y), x = `Num contigs`))+
+  geom_col()+theme_classic()
+
+ptr + glen + gcon
+
+```
+
+## 11.4 MAGs representation in samples
+
+
+```{r}
+#obtain total number of reads per sample, and filter out Unclassified, No CDS and Unmapped:
+reads_mapped = RhizCom$taxa$superkingdom$abund %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "tax") %>%
+  filter(tax != "No CDS" & tax != "Unclassified" & tax != "Unmapped") %>% 
+  select(-tax) %>% colSums() %>% reshape2::melt(value.name = "mapped") %>% rownames_to_column(var="sample")
+head(reads_mapped)
+
+#obtain total number of reads mapped against MAGs
+bins_abund = RhizCom$bins$abund
+bins_abund = rownames_to_column(as.data.frame(bins_abund), "MAG_ID")
+bins_abund = bins %>% #change by mags_info for only mid-to-high MAGS
+  select(Bin.ID, Quality) %>% 
+  right_join(bins_abund, by=c("Bin.ID"="MAG_ID")) #left-join for only mid-to-high MAGs
+
+bins_abund = bins_abund %>% 
+  filter(Quality != "Discarded") %>%
+  group_by(Quality) %>%
+  summarise(STB1 = sum(STB1), STB2 = sum(STB2), STB3 = sum(STB3),
+            RhizCom1 = sum(RhizCom1), RhizCom2=sum(RhizCom2), RhizCom3=sum(RhizCom3),
+            Soil1=sum(Soil1), Soil2=sum(Soil2), Soil3=sum(Soil3)) %>% 
+  reshape2::melt(value.name = "mappedMAG")
+
+#CREATE METADATA
+metadata=data.frame("samples" = c("STB1", "STB2", "STB3", "RhizCom1", "RhizCom2", "RhizCom3", "Soil1", "Soil2", "Soil3"),
+                       "condition" = c(rep("STB", 3), rep("RhizCom", 3), rep("Soil", 3)))
+rownames(metadata) = metadata$samples
+
+bins_abund = left_join(reads_mapped, bins_abund, by=c("sample"="variable"))
+bins_abund$perc = bins_abund$mappedMAG * 100 / bins_abund$mapped
+bins_abund = left_join(bins_abund, metadata, by= c("sample"="samples"))
+
+ggplot(bins_abund, aes(x=sample, y=perc, fill=Quality))+
+  geom_col()+
+  ylab("Reads mapped to MAGs (%)")+
+  scale_fill_manual(values= c("#36164C", "#764A93", "#5B6291", "#90A0B7", "#BCBCBC"))+
+  #geom_text(aes(label = round(perc, 2)), fun.y="sum", size=4)+
+  stat_summary(aes(label = round(stat(y), 2), group=1), fun='sum', geom="text", size=4)+
+  theme_pubclean() + theme(axis.line = element_line())
+```
+
+# 12 MAGs annotations
+
+Extract annotations
+
+```{r}
+ctg_bins = data.frame(RhizCom$contigs$table) %>% rownames_to_column("ctg_name") %>% select(ctg_name, Bin.ID)
+
+mags_annot = mags_info %>% 
+  select(MAG_name, MAG_ID, Comm_adscription, Quality) %>% #Keep quality in case I wanna further filter
+  #Modify MAG_ID to match contigs
+  mutate(MAG_ID = str_remove(MAG_ID, ".fa.contigs|.fasta.contigs")) %>%
+  #add bins
+  left_join(ctg_bins, by=c("MAG_ID"="Bin.ID"), multiple = "all") %>%
+  #Merge with Orfs
+  left_join(data.frame(RhizCom$orfs$table), by=c("ctg_name" = "Contig.ID"), multiple = "all")
+
+head(mags_annot)
+
+bins_annot = bins_info %>% 
+  select(Bin.ID, Comm_adscription, Quality) %>% #Keep quality in case I wanna further filter
+  #Modify MAG_ID to match contigs
+  mutate(Bin.ID = str_remove(Bin.ID, ".fa.contigs|.fasta.contigs")) %>%
+  #add bins
+  left_join(ctg_bins, by=c("Bin.ID"="Bin.ID"), multiple = "all")%>%
+  #Merge with Orfs
+  left_join(data.frame(RhizCom$orfs$table), by=c("ctg_name" = "Contig.ID"), multiple = "all")
+  #Merge with Orfs
+```
+
+Separate multiple KEGG annotations, as a protein can be involved in multiple pathways:
+
+```{r}
+#separate multiple KEGG annotations:
+mags_annot.kegg = mags_annot %>% separate_rows(KEGGPATH, sep="\\s*\\|\\s*")
+
+#Remove Human diseases and organisimal systems (does not apply to our dataset) and paths not available
+mags_annot.kegg = mags_annot.kegg %>% 
+  filter(!str_detect(KEGGPATH, "Human Diseases") &
+           !str_detect(KEGGPATH, "Organismal Systems") &
+           !str_detect(KEGGPATH, "path not available") &
+           !str_detect(KEGGPATH, "eukaryotes") &
+           !grepl("Unclassified", KEGGPATH))
+
+#Populate hierarchies
+mags_annot.kegg = mags_annot.kegg %>%
+  separate(col=KEGGPATH, into=c("PathLv1", "PathLv2", "PathLv3"), sep= "; ", remove=T)
+
+head(mags_annot.kegg)
+```
+
+## 12.1 Count annotations
+
+Calculate if there is a different abundance (number of annotations) of certain functional categories.
+
+The difference between MAGs and Bins is only that Bins contains also low quality mags, so we are only going to use MAGs.
+
+```{r}
+#Add numeric count
+mags_annot.kegg$count=1
+#Add last tax
+mags_annot.kegg = mags_annot.kegg %>%
+  left_join(select(mags_info, MAG_name, LastTax), by = "MAG_name")
+
+mags_fun_plots = list()
+for (i in unique(mags_annot.kegg$PathLv1)){
+   filt_data = mags_annot.kegg %>% 
+     filter(Comm_adscription %in% c("RhizCom", "SbRB", "Soil")) %>% #Removed MAGs in mixed comms
+     filter(PathLv1 == i) %>%
+    group_by(MAG_name, Comm_adscription, Quality, PathLv2, PathLv3, LastTax) %>% 
+    summarise(count = sum(count))
+  for (j in unique(filt_data$PathLv2)){
+    if (is.na(j)) {next} #if we want to skip NA
+    #Filter databy levl2
+    filt_data2 = filt_data %>% filter(PathLv2 == j) %>%
+      group_by(MAG_name, Comm_adscription, Quality, PathLv2, PathLv3, LastTax) %>% 
+      summarise(count = sum(count))
+    for (k in unique(filt_data2$PathLv3)){
+      filt_data3 = filt_data2 %>% filter(PathLv3 == k) %>%
+        group_by(MAG_name, Comm_adscription, Quality, PathLv2, PathLv3, LastTax) %>%
+        summarise(count = sum(count))
+    
+       name = paste0(i, "_", j, "_", k)
+      #perform statistics with VEGAN
+     
+    kw <- tryCatch({
+    agricolae::kruskal(filt_data3$count, filt_data3$Comm_adscription, p.adj = "BH")
+  }, error = function(e) {
+    # Print the error message (optional) for debugging
+    message("Error with PathLv1: ", i, ", PathLv2: ", j, ", PathLv3: ", k, " - ", e$message)
+    return(NULL)  # Return NULL to indicate an error
+  })
+
+  # Skip to the next iteration if there was an error
+  if (is.null(kw)) {
+    next
+  }
+
+
+    kwres = rownames_to_column(kw$groups, var="StateEnviron")
+    
+     #plot
+    pos = position_jitter(width = 0.2, seed=2)
+    mags_fun_plots[[name]] = ggplot(filt_data3, aes(x=Comm_adscription, y= count)) +
+      geom_boxplot(outlier.color = "red", shape=16) + 
+      geom_jitter(size = 2, shape=16, position = pos, aes(color=Quality), alpha=0.5)+
+       geom_text(stat = "count", aes(label = ..count.., y=after_stat(-5)), vjust = -0.5)+
+      #stat_compare_means(comparisons = list(c("RhizCom", "SbRB")), method = "wilcox.test")+
+      annotate(geom = "text", x=kwres$StateEnviron, y=max(filt_data3$count)+2, label=kwres$groups)+
+      ggtitle(paste0(i," - ", j, "\n", k), subtitle = paste0("Kruskal-Wallis p-value = ",  round(kw$statistics$p.chisq, 5), 
+                                                               "\nChisqr = ", round(kw$statistics$Chisq, 5)))+
+      scale_color_manual(values=c("#36164C", "#764A93", "#5B6291"))+
+
+      ylab("Number of annotations")+xlab("Community assigment")+
+      #geom_text_repel(aes(label=paste0(MAG_name, "_", LastTax)), min.segment.length = 0, size=2, max.overlaps = 100, position = pos)+
+      geom_text_repel(data = filter(filt_data3, Comm_adscription == "SbRB"), 
+                      aes(label=paste0(MAG_name, "_", LastTax)), min.segment.length = 0, size=2, max.overlaps = 100, position = pos)+
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+                   
+    }
+  }
+}
+
+  
+#Explore manually and represent only interesting ones or those with differences
+mags_fun_plots_signi = list()
+for (i in names(mags_fun_plots)){
+  pval = gsub("Kruskal-Wallis p-value = |\nChisqr = (.*)$", "", mags_fun_plots[[i]]$labels$subtitle)
+  if(pval <= 0.5){mags_fun_plots_signi[[i]] = mags_fun_plots[[i]]}
+}
+
+  
+#Metabolism
+ggarrange(mags_fun_plots$`Metabolism_Carbohydrate metabolism_Fructose and mannose metabolism`,
+          mags_fun_plots$`Metabolism_Carbohydrate metabolism_Starch and sucrose metabolism`,
+          mags_fun_plots$`Metabolism_Metabolism of cofactors and vitamins_Nicotinate and nicotinamide metabolism`,
+          mags_fun_plots$`Metabolism_Metabolism of cofactors and vitamins_Riboflavin metabolism`,
+          #mags_fun_plots$`Metabolism_Biosynthesis of other secondary metabolites_Neomycin, kanamycin and gentamicin biosynthesis`,
+          #mags_fun_plots$`Metabolism_Biosynthesis of other secondary metabolites_Streptomycin biosynthesis`, 
+          common.legend = T, align = "hv", nrow = 1)
+
+#brite hierarchies
+ggarrange(mags_fun_plots$`Brite Hierarchies_Protein families: genetic information processing_Transcription factors`,
+          mags_fun_plots$`Brite Hierarchies_Protein families: signaling and cellular processes_Transporters`)
+
+#Cellular processes
+ggarrange(mags_fun_plots$`Cellular Processes_Cell motility_Bacterial chemotaxis`,
+          mags_fun_plots$`Cellular Processes_Cell motility_Flagellar assembly`)
+
+
+#check!
+ggarrange(mags_fun_plots$`Metabolism_Carbohydrate metabolism_Citrate cycle (TCA cycle)`,
+          mags_fun_plots$`Metabolism_Carbohydrate metabolism_Glycolysis / Gluconeogenesis`,
+          mags_fun_plots$`Metabolism_Carbohydrate metabolism_Pentose phosphate pathway`)
+
+```
+
+
+##12.2 Enriched reactions
+
+For each of the pathways identified as having differential number of annotations, we can further interrogate which specific reactions within each pathway are more abundant. This might give specific clues as to what is different between communities and again testing if those reactions are predominantly present in a specific community.
+
+We will do this by first extracting all the reactions within a specific pathway, 
+
+###12.2.1 Reactions
+
+Obtain a list of all unique KEGG.IDs in MAGs. Then search for the reaction(s) they participate it, and then ill left-join them again.
+
+```{r}
+#load if previously saved
+#keggs_reacts_res = read.table("kegg_reacts.txt", header = T, sep = "\t", quote = "")
+
+#Obtain unique keggsin hihg-medium MAGS
+keggs_reacts = mags_annot %>% 
+  filter(KEGG.ID != "") %>%
+  separate_rows(KEGG.ID, sep = ";") %>%
+  select(KEGG.ID) %>%
+  mutate(KEGG.ID = gsub("\\*", "", KEGG.ID)) %>%
+  unique()
+
+
+#Empty df to store results
+keggs_reacts_res <- data.frame(KEGG.ID = character(), Reactions_ID = character())
+count <- 0
+total <- length(keggs_reacts$KEGG.ID)
+
+for (i in keggs_reacts$KEGG.ID) {
+  count <- count + 1
+  percent_complete <- round(count / total * 100, 2)
+  
+  # Print progress at whole percentage points
+  if (percent_complete %% 1 == 0 || count == total) {
+    print(paste0("Processing ", count, "/", total, " - ", percent_complete, "%"))
+  }
+  
+  Sys.sleep(0.5)  # Delay to prevent rate limiting
+
+  # Retrieve reactions
+  kegg_data <- tryCatch({
+    keggGet(i)
+  }, error = function(e) {
+    message("Error with KEGG ID ", i, ": ", e$message)
+    NULL
+  })
+  
+  if (!is.null(kegg_data) && !is.null(kegg_data[[1]]$REACT)) {
+    reactions <- names(kegg_data[[1]]$REACT)
+    result <- paste(reactions, collapse = ";")
+  } else {
+    result <- NA
+  }
+  
+  keggs_reacts_res <- rbind(keggs_reacts_res, data.frame(KEGG.ID = i, Reactions_ID = result, stringsAsFactors = FALSE))
+}
+
+#Save results!
+#write.table(keggs_reacts_res, "kegg_reacts.txt", quote = F, sep = "\t", row.names = F)
+head(keggs_reacts_res)
+```
+
+Map back the reaction ID to the KEGG.ID in the mag_annot dataframe
+
+```{r}
+mags_annot_react = mags_annot %>%
+  mutate(KEGG.ID = gsub("\\*", "", KEGG.ID)) %>%
+  separate_rows(KEGG.ID, sep=";") %>%
+  left_join(keggs_reacts_res, by = "KEGG.ID") %>%
+  separate_rows(Reactions_ID, sep = ";")
+
+head(mags_annot_react)
+```
+
+This table contains per gene within a mag, the reaction ID it is assigned to.
+
+Now, per pathway of interest, we are gonna retrieve all the reactions from that pathway and count how many times they appear in each of the communities mags:
+
+```{r}
+path_ids = c("00500", "00051", "00760", "00740")
+
+reactions_plots = list()
+for (p in path_ids){
+  p_info_rc = gsub("rn:", "", unname(keggLink("reaction", paste0("map", p))))
+  for (r in p_info_rc){
+    #skip iteration if r not found in data
+    if (!r %in% unique(mags_annot_react$Reactions_ID)){next}
+    print(paste0("Processing ", r))
+    annots = mags_annot_react %>% filter(Reactions_ID == r & Comm_adscription != "RhizCom_and_Soil") %>%
+        mutate(count = 1) %>%
+        group_by(MAG_name, Comm_adscription, Quality, KEGG.ID, KEGGFUN, KEGGPATH, Reactions_ID) %>%
+        summarise(count = sum(count), .groups = "drop")
+    
+    #add stats
+    #handle non-computing stats errors.
+    kw = tryCatch({
+      agricolae::kruskal(annots$count, annots$Comm_adscription, p.adj = "BH")
+    }, error = function(e) {
+      message("Error with: ", p, ", reaction ID: ", r, " ", e$message)
+      return(NULL)
+    })
+    
+    if (is.null(kw)) {
+    next
+      }
+    
+    kwres = rownames_to_column(kw$groups, var="StateEnviron")
+      
+    if (round(kw$statistics$p.chisq, 5) > 0.05 && all(c("Soil", "RhizCom", "SbRB") %in% unique(annots$Comm_adscription))){next} #skip non-significant results!
+      
+    #plot to list
+    reactions_plots[[r]] = ggplot(annots, aes(x=Comm_adscription, y= count)) +
+      geom_boxplot(outlier.color = "red", shape=16) + 
+      geom_jitter(size = 2, shape=16, position = position_jitter(width = 0.2, seed=2), aes(color=Quality), alpha=0.5)+
+      geom_text(stat = "count", aes(label = ..count.., y=after_stat(-5)), vjust = -0.5)+
+      annotate(geom = "text", x=kwres$StateEnviron, y=max(annots$count)+2, label=kwres$groups)+
+      ggtitle(paste0(p," - ", r, "\n", keggFind("reaction", r)), subtitle = paste0("Kruskal-Wallis p-value = ",  round(kw$statistics$p.chisq, 5), 
+                                                             "\nChisqr = ", round(kw$statistics$Chisq, 5)))+
+      
+      scale_color_manual(values=c("#36164C", "#764A93", "#5B6291"))+
+      ylab("Number of annotations")+xlab("Community assigment")+
+      geom_text_repel(data = filter(annots, Comm_adscription == "SbRB"), 
+                    aes(label=MAG_name), min.segment.length = 0, size=2, max.overlaps = 100, position = position_jitter(width = 0.2, seed=2))+
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  }
+}
+
+#Check results and curate to either significantly more in RhizCom/SbRB vs. Soil or not present in soil!
+reactions_plots
+
+reacts_interest = c("R00299", "R00811", "R00837", "R03921", "R04111", "R05140", "R10486", "R11172", "R11311", "R00758", "R00868", "R01059", "R01068", "R02568", "R02704", "R02925", "R03396", "R03398", "R08692", "R12897")
+```
+
+
+Check the ones were the stats could not be computed, and add to the list below! The might be important but only present in a very limited number of MAGs!
+Don't mind the stats. For two groups should be Wilcoxon. I'll do that with the selected reactions.
+
+For each of the reactions of interest, we can plot in a heatmap to see the distribution if these reactions are present or not per mag
+
+```{r}
+reacts_interest = c("R00299", "R00811", "R03921", "R04111", "R10486", "R00028", "R02780", "R00837", "R11172", "R00839", "R05140", "R11311",
+                    "R00766", "R00803", "R00805", "R00838", "R01555", "R11310",
+                    "R02568", "R01068", "R00866", "R01059", "R00868", "R02704", "R00758", "R02925",
+                    "R08639",
+                    "R00760")
+
+
+reacts_interest_distr = mags_annot_react %>% filter(Reactions_ID %in% reacts_interest) %>%
+  group_by(MAG_name, Reactions_ID) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Reactions_ID, values_from = count, values_fill = 0)
+
+head(reacts_interest_distr)
+
+com_adss = data.frame(reacts_interest_distr) %>%
+  left_join(select(mags_info, MAG_name, Comm_adscription), by = "MAG_name") %>%
+  select(MAG_name, Comm_adscription)
+
+ordered_rows = order(com_adss$Comm_adscription)
+
+Heatmap(reacts_interest_distr %>% column_to_rownames(var = "MAG_name") %>% t(), 
+        column_order = ordered_rows, 
+        row_order = reacts_interest,
+        cluster_rows = F,
+        col = colorRamp2(c(0, 1, 10), c("grey90","skyblue3", "darkblue")),border = T,
+        top_annotation = HeatmapAnnotation(df = com_adss$Comm_adscription),
+        heatmap_legend_param = list(title = "Number of annotations"))
+
+
+```
+
+Plot boxplots of specific reactions again (instead of all of them), including additional reactions we might have added to corroborate the presence of lower metabolic pathways, without them needed to be specifically different between communities.
+
+And let's handle the statistic better; KW if 3 groups and Wilcoxon if 2.
+
+```{r}
+reactions_plots2 = list()
+
+for (r in reacts_interest2){
+  annots = mags_annot_react %>%
+    filter(Reactions_ID == r & Comm_adscription != "RhizCom_and_Soil") %>%
+    mutate(count = 1) %>%
+    group_by(MAG_name, Comm_adscription, Quality, KEGG.ID, KEGGFUN, KEGGPATH, Reactions_ID) %>%
+    summarise(count = sum(count), .groups = "drop")
+  
+  # Determine how many unique groups are present
+  unique_groups = length(unique(annots$Comm_adscription))
+  
+  if (unique_groups == 3) {
+    # Perform Kruskal-Wallis test when there are 3 groups
+    kw = tryCatch({
+      agricolae::kruskal(annots$count, annots$Comm_adscription, p.adj = "BH")
+    }, error = function(e) {
+      message("Error with Kruskal-Wallis for: ", r, " - ", e$message)
+      return(NULL)
+    })
+    
+    if (!is.null(kw)) {
+      kwres = rownames_to_column(kw$groups, var = "StateEnviron")
+      
+      # Create plot with Kruskal-Wallis annotations
+      reactions_plots2[[r]] = ggplot(annots, aes(x = Comm_adscription, y = count)) +
+        geom_boxplot(outlier.color = "red", shape = 16) + 
+        geom_jitter(size = 2, shape = 16, aes(color = Quality), alpha = 0.5) +
+        geom_text(stat = "count", aes(label = ..count.., y = after_stat(-2)), vjust = -0.5) +
+        annotate(geom = "text", x = kwres$StateEnviron, y = max(annots$count) + 2, label = kwres$groups) +
+        ggtitle(paste0(r, "\n", keggFind("reaction", r)), 
+                subtitle = paste0("Kruskal-Wallis p-value = ", round(kw$statistics$p.chisq, 5),
+                                  "\nChisqr = ", round(kw$statistics$Chisq, 5))) +
+        scale_color_manual(values = c("#36164C", "#764A93", "#5B6291")) +
+        scale_y_continuous(limits = c(-2, 18)) +
+        scale_x_discrete(limits = c("RhizCom", "SbRB", "Soil")) +  # Force the x-axis levels
+        ylab("Number of annotations") + xlab("Community assignment") +
+        theme_bw()+
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+    
+    } else {
+      # Create plot without statistics when Kruskal-Wallis fails
+      reactions_plots2[[r]] = ggplot(annots, aes(x = Comm_adscription, y = count)) +
+        geom_boxplot(outlier.color = "red", shape = 16) + 
+        geom_jitter(size = 2, shape = 16, aes(color = Quality), alpha = 0.5) +
+        geom_text(stat = "count", aes(label = ..count.., y = after_stat(-2)), vjust = -0.5) +
+        ggtitle(paste0(r, "\n", keggFind("reaction", r)), subtitle = "Kruskal-Wallis test could not be calculated") +
+        scale_color_manual(values = c("#36164C", "#764A93", "#5B6291")) +
+        scale_y_continuous(limits = c(-2, 18)) +
+        scale_x_discrete(limits = c("RhizCom", "SbRB", "Soil")) +  # Force the x-axis levels
+        ylab("Number of annotations") + xlab("Community assignment") +
+        theme_bw()+
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+    }
+    
+  } else if (unique_groups == 2) {
+    # Perform Wilcoxon test when there are exactly 2 groups
+    wilcox = tryCatch({
+      wilcox.test(count ~ Comm_adscription, data = annots)
+    }, error = function(e) {
+      message("Error with Wilcoxon for: ", r, " - ", e$message)
+      return(NULL)
+    })
+    
+    if (!is.null(wilcox)) {
+      # Create plot with Wilcoxon annotations
+      reactions_plots2[[r]] = ggplot(annots, aes(x = Comm_adscription, y = count)) +
+        geom_boxplot(outlier.color = "red", shape = 16) + 
+        geom_jitter(size = 2, shape = 16, aes(color = Quality), alpha = 0.5) +
+        geom_text(stat = "count", aes(label = ..count.., y = after_stat(-2)), vjust = -0.5) +
+        ggtitle(paste0(r, "\n", keggFind("reaction", r)), 
+                subtitle = paste0("Wilcoxon p-value = ", round(wilcox$p.value, 5))) +
+        scale_color_manual(values = c("#36164C", "#764A93", "#5B6291")) +
+        scale_y_continuous(limits = c(-2, 18)) +
+        scale_x_discrete(limits = c("RhizCom", "SbRB", "Soil")) +  # Force the x-axis levels
+        ylab("Number of annotations") + xlab("Community assignment") +
+        theme_bw()+
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+    
+    } else {
+      # Create plot without statistics when Wilcoxon fails
+      reactions_plots2[[r]] = ggplot(annots, aes(x = Comm_adscription, y = count)) +
+        geom_boxplot(outlier.color = "red", shape = 16) + 
+        geom_jitter(size = 2, shape = 16, aes(color = Quality), alpha = 0.5) +
+        geom_text(stat = "count", aes(label = ..count.., y = after_stat(-2)), vjust = -0.5) +
+        ggtitle(paste0(r, "\n", keggFind("reaction", r)), subtitle = "Wilcoxon test could not be calculated") +
+        scale_color_manual(values = c("#36164C", "#764A93", "#5B6291")) +
+        scale_y_continuous(limits = c(-2, 18)) +
+        scale_x_discrete(limits = c("RhizCom", "SbRB", "Soil")) +  # Force the x-axis levels
+        ylab("Number of annotations") + xlab("Community assignment") +
+        theme_bw()+
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+    }
+    
+  } else {
+    # Create plot when there's insufficient data for any test
+    reactions_plots2[[r]] = ggplot(annots, aes(x = Comm_adscription, y = count)) +
+      geom_boxplot(outlier.color = "red", shape = 16) + 
+      geom_jitter(size = 2, shape = 16, aes(color = Quality), alpha = 0.5) +
+      geom_text(stat = "count", aes(label = ..count.., y = after_stat(-2)), vjust = -0.5) +
+      ggtitle(paste0(r, "\n", keggFind("reaction", r)), subtitle = "Insufficient groups for statistical test") +
+      scale_color_manual(values = c("#36164C", "#764A93", "#5B6291")) +
+      scale_y_continuous(limits = c(-2, 18)) +
+      scale_x_discrete(limits = c("RhizCom", "SbRB", "Soil")) +  # Force the x-axis levels
+      ylab("Number of annotations") + xlab("Community assignment") +
+      theme_bw()+
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+  }
+}
+
+
+ggarrange(plotlist = reactions_plots2 ,
+          align = "hv", common.legend = T)
+
+```
+
+
+###12.2.2 Entire pathway for Nicotinate/Riboflavin
+
+In the case of nicotinate and Riboflavin, there's no point on looking for specific reactions, as is the whole pathway that needs to be present to biosynthetize the vitamins. In this case, we can search for those mags in which all of them are present:
+
+```{r}
+vitamins = list(nicotinate = "R07407,R00481;R04292;R03348;R03346;R02295",
+                riboflavin = "R00425;R03459;R03458;R07280;R07281;R04457;R00066;R00549;R00161")
+
+# Function to process each pathway
+calculate_pathway_completion <- function(vitamin_reactions, mags_annot_react) {
+  # Initialize the results list
+  results = list()
+
+  # Split the reactions for AND (;) and OR (,)
+  pathway_blocks = strsplit(vitamin_reactions, ";")[[1]]
+
+  # Loop through each MAG
+  for (mag in unique(mags_annot_react$MAG_name)) {
+    mag_data = mags_annot_react %>% filter(MAG_name == mag)
+    
+    # Store individual reaction counts
+    reaction_counts = list()
+    total_blocks = length(pathway_blocks)
+    completed_blocks = 0
+    
+    # Loop through each block (AND-separated reactions)
+    for (block in pathway_blocks) {
+      # Handle OR condition within the block
+      or_reactions = strsplit(block, ",")[[1]]
+      
+      # Check how many OR reactions are present
+      found_reactions = mag_data %>% filter(Reactions_ID %in% or_reactions)
+      
+      if (nrow(found_reactions) > 0) {
+        completed_blocks = completed_blocks + 1
+        reaction_counts[[block]] = nrow(found_reactions)  # Store the count
+      } else {
+        reaction_counts[[block]] = 0  # No reactions found for this block
+      }
+    }
+    
+    # Calculate the percentage of pathway completion
+    completion_percentage = (completed_blocks / total_blocks) * 100
+    
+    # Store the results
+    results[[mag]] = c(reaction_counts, completion = completion_percentage)
+  }
+  
+  # Convert results to a dataframe
+  results_df = do.call(rbind, lapply(results, as.data.frame)) %>%
+    rownames_to_column(var = "MAG_name")
+  
+  return(results_df)
+}
+
+# Create empty list to store the pathway completion results for both vitamins
+vitamin_completion_results = list()
+
+# Loop over the vitamins list to calculate the completion percentage
+for (vitamin in names(vitamins)) {
+  vitamin_reactions = vitamins[[vitamin]]
+  vitamin_completion_results[[vitamin]] = calculate_pathway_completion(vitamin_reactions, mags_annot_react)
+}
+
+# Combine the results for both pathways (nicotinate and riboflavin) into a single dataframe
+vitamin_completion_results = bind_rows(vitamin_completion_results, .id = "Vitamin") %>%
+  left_join(select(mags_info, MAG_name, Comm_adscription), by = "MAG_name")
+
+# View the final results
+print(vitamin_completion_results)
+```
+
+And represent
+
+```{r}
+vitamin_completion_results$Comm_adscription = factor(vitamin_completion_results$Comm_adscription, 
+                                                      levels = c("SbRB", "Soil", "RhizCom"))
+
+vitamin_completion_results = vitamin_completion_results %>%
+  arrange(Comm_adscription) %>%
+  mutate(MAG_name = factor(MAG_name, levels = unique(MAG_name)))
+
+ggplot(vitamin_completion_results, aes(x=Vitamin, y=MAG_name))+
+  geom_tile(aes(fill=completion))+
+  scale_fill_gradient2(low="white", mid= "darkseagreen3", high="darkgreen", midpoint = 85, limits= c(70,100), na.value = "white")
+```
+
+
+# 14 DAA of KEGG ANNOTATIONS
+
+Before doing a differential analysis of the KEGG annotations among samples, it would be good to set a threshold of abundance to discard those KEGGs with very little relevance. As DESEq uses raw abundances and not normalized (TPMs), because it will calculate the normalization by its own, the filter should be applied on abundance. Lets explore the distribution of KEGGs abundances to determine an appropriate threshold.
+
+```{r}
+kegg_abund = as.data.frame(RhizCom$functions$KEGG$abund) %>% 
+  mutate(AbundTotal = log10(rowSums(.)),
+         AbundRhizCom = log10(rowSums(select(., starts_with("RhizCom")))),
+         AbundSoil = log10(rowSums(select(., starts_with("Soil")))),
+         AbundSbRB = log10(rowSums(select(., starts_with("STB"))))) %>% 
+  select(AbundTotal, AbundRhizCom, AbundSoil, AbundSbRB) %>%
+  rownames_to_column("KEGG.ID")
+head(kegg_abund)
+
+ggplot(kegg_abund, aes(x=AbundTotal)) +
+  #geom_histogram(binwidth = 1, color="black", fill="steelblue3")+
+  geom_histogram(binwidth = 0.2, color="grey40", fill="grey80")+
+  xlab("log10(sum samples abundance)")+
+  geom_vline(xintercept = log10(1000), linetype="dashed", color="red")+
+  scale_x_continuous(breaks = seq(1, 10, 1))+
+  theme_classic()
+
+#count how many KEGGs will be discarded
+print(paste0("KEGGs before: ", nrow(kegg_abund)))
+print(paste0("KEGGs after (>= 1000 sum abund): ", nrow(filter(kegg_abund,AbundTotal >= log10(1000)))))
+
+#Now a Cumulative Distribution Plot
+ggplot(reshape2::melt(kegg_abund), aes(x=value, colour=variable))+
+  stat_ecdf(geom="step") +
+  ylab("Cummulative density")+ xlab("log10(sum samples abundance)")+
+  geom_vline(xintercept = log10(1000), linetype="dashed", color="red")+
+  scale_x_continuous(breaks = seq(1, 10, 1))+
+  scale_color_manual(values=c("black", "#2E7272","#AF8080", "#CEA241"))+
+  theme_classic()
+
+```
+
+Using a threshold of 1000 across samples seem like a good option, as it retains the 75% of KEGGs.
+
+
+Format the data for the differential abundance analysis (DAA)
+
+```{r}
+kegg_abund = as.data.frame(RhizCom$functions$KEGG$abund) #contains counts, as appropriate for DESeq2.
+head(kegg_abund)
+
+kegg_before = nrow(kegg_abund)
+
+#filter out low abundant keggs:
+kegg_threshold = 1000 
+kegg_abund = as.data.frame(kegg_abund) %>% filter(rowSums(.) >= kegg_threshold)
+
+kegg_after = nrow(kegg_abund)
+
+print(paste0("KEGGs before filtering: ",kegg_before))
+print(paste0("KEGGs after filtering (>= ", kegg_threshold, " TPM sum): ", kegg_after))
+
+
+#create the metadata
+metadata=data.frame("samples" = colnames(kegg_abund),
+                       "condition" = c(rep("STB", 3), rep("RhizCom", 3), rep("Soil", 3)))
+rownames(metadata) = metadata$samples
+head(metadata)
+
+#Sanity check:
+all(rownames(metadata)==colnames(kegg_abund))
+
+
+#Create orfs table to add info to DAA results
+keggs = as.data.frame(RhizCom$misc$KEGG_names) %>% rownames_to_column("KEGG.ID") %>%
+  left_join(as.data.frame(RhizCom$misc$KEGG_path) %>% rownames_to_column("KEGG.ID"), by="KEGG.ID") %>%
+  column_to_rownames("KEGG.ID")
+colnames(keggs) = c("KEGG_names", "KEGG_path")
+head(keggs)
+
+```
+
+DAA of the 3 pairwise comparisons.
+
+```{r}
+#define cutoffs for differential abundance
+alpha=0.001
+l2FC = 2.5
+
+n= 0
+p= list()
+c= list()
+all_results = data.frame()
+all_counts = data.frame()
+
+#Create list of comparisons to perform
+daa.comparisons = list(c("Soil", "RhizCom"), 
+                       c("STB", "RhizCom"),
+                       c("Soil", "STB")) #The last one not needed, but doesn't hurt to have it
+
+for (x in daa.comparisons){
+  n=n+1 
+  #Reestart the dds each time?
+  dds = DESeqDataSetFromMatrix(countData = kegg_abund, colData = metadata, design = ~condition)
+  dds$condition <- factor(dds$condition, levels = c(x[1],x[2]))
+  dds <- dds[, dds$condition %in% c(x[1],x[2]) ]
+  #perform the deseq
+  daa=DESeq(dds, test = "Wald", fitType = "local")
+  res=results(daa)
+  
+  filename = paste0("DESeq2/", n, "_DESeq2_raw_", 
+                    levels(dds$condition)[1], "_vs_", 
+                    levels(dds$condition)[2], "_table.tab")
+  write.table(cbind(as(res, "data.frame"), as(keggs[rownames(res), ], "matrix")), 
+              file= filename, quote=F, sep="\t")
+  
+  #FILTER FOR VOLCANO PLOT
+  volcano = cbind(as(res, "data.frame"), as(keggs[rownames(res), ], "matrix"))
+  volcano = rownames_to_column(volcano, var="KEGG.ID")
+  #add the condition!!
+  volcano$condition = paste0(n,"_",levels(dds$condition)[1], "_vs_", levels(dds$condition)[2])
+  volcano$diffexpressed = "NO"
+  volcano$diffexpressed[volcano$log2FoldChange <= -l2FC & volcano$padj < alpha] = paste0(levels(dds$condition)[1])
+  volcano$diffexpressed[volcano$log2FoldChange >= l2FC & volcano$padj < alpha] = paste0(levels(dds$condition)[2])
+  #second codition for "venn diagrams"
+  volcano$cond = "NO"
+  volcano$cond[volcano$log2FoldChange <= -l2FC & volcano$padj < alpha] = paste0(levels(dds$condition)[1])
+  volcano$cond[volcano$log2FoldChange >= l2FC & volcano$padj < alpha] = paste0(levels(dds$condition)[2])
+  #labels
+  #label1 = KEGG_names
+  volcano$label1 = NA
+  volcano$label1[volcano$diffexpressed != "NO"] = volcano$KEGG_names[volcano$diffexpressed != "NO"]
+  #label2 = KEGG_path
+  volcano$label2 = NA
+  volcano$label2[volcano$diffexpressed != "NO"] = volcano$KEGG_path[volcano$diffexpressed != "NO"]
+  
+
+  #Counts of diff expressed per condition.
+  counts = volcano %>% group_by(condition, cond) %>% dplyr::count()
+  
+  
+  #save the volcano and counts results as a combination of comparisons tables
+  all_results = rbind(all_results, volcano)
+  all_counts = rbind(all_counts, counts)
+}
+
+daa.results = all_results
+write.table(all_results, "DESeq2/all_results.txt", quote = F, sep="\t", row.names = F)
+write.table(all_counts, "DESeq2/all_counts.txt", quote = F, sep="\t", row.names = F)
+```
+
+Individual comparison results as well as combined results are stored in DESeq2/...
+
+In case we are restarting the session, load the results and plot volcano plots as a sanity check
+
+```{r}
+#Load results
+daa.results = read.table("DESeq2/all_results.txt", 
+                         header = T, sep = "\t", fill = T, quote = "")
+
+ggplot(daa.results, aes(x=log2FoldChange, y=-log(padj,10), col=diffexpressed)) + 
+  geom_point(alpha = 0.5, shape=16) +
+  #geom_text_repel(data=daa.results,
+  #                aes(label=label2), 
+  #                    max.overlaps = 45, size=2, force = 4) +
+  geom_vline(xintercept=c(2.5, -2.5), col="grey", alpha=0.5) +
+  geom_hline(yintercept=-log10(0.001), col="grey", alpha=0.5) +
+  scale_color_manual(values=c("grey80","#2E7272","#AF8080", "#CEA241")) +
+  facet_wrap(~condition, nrow = 2, scales = "free") +
+  theme_classic2() + theme(strip.background = element_blank())
+```
+
+There's a huge number of KEGGs that are differentially abundant in either comparison.
+
+
+
+# 15 Ternary space of KEGG annotations
+As we have 3 pairwise comparisons, this might be better represented in a ternary space, where the TPMs (as a measure of relative abundance across samples) are used to calculate the % of contribution of the ternary coordinates.
+
+## 15.1 TPM threshold
+
+Aside of the rheshold used of the DAA calculation, we should apply also a minimum threshold for representing a KEGG into the ternary space. In this case, we will similarly wevaluate the distribution of KEGG TPMs.
+
+
+```{r}
+kegg_tpm_thres = 0.5
+
+kegg_tpm = as.data.frame(RhizCom$functions$KEGG$tpm) %>% 
+  mutate(AbundTotal = log10(rowSums(.)),
+         AbundRhizCom = log10(rowSums(select(., starts_with("RhizCom")))),
+         AbundSoil = log10(rowSums(select(., starts_with("Soil")))),
+         AbundSbRB = log10(rowSums(select(., starts_with("STB"))))) %>% 
+  select(AbundTotal, AbundRhizCom, AbundSoil, AbundSbRB) %>%
+  rownames_to_column("KEGG.ID")
+head(kegg_tpm)
+
+ggplot(kegg_tpm, aes(x=AbundTotal)) +
+  #geom_histogram(binwidth = 1, color="black", fill="steelblue3")+
+  geom_histogram(binwidth = 0.2, color="grey40", fill="grey80")+
+  xlab("log10(sum samples abundance)")+
+  geom_vline(xintercept = log10(kegg_tpm_thres), linetype="dashed", color="red")+
+  scale_x_continuous(breaks = seq(1, 10, 1))+
+  theme_classic()
+
+#count how many KEGGs will be discarded
+print(paste0("KEGG TPMs before: ", nrow(kegg_tpm)))
+print(paste0("KEGGs TPMs after (>= ",kegg_tpm_thres," sum abund): ", nrow(filter(kegg_tpm,AbundTotal >= log10(kegg_tpm_thres)))))
+
+#Now a Cumulative Distribution Plot
+ggplot(reshape2::melt(kegg_tpm), aes(x=value, colour=variable))+
+  stat_ecdf(geom="step") +
+  ylab("Cummulative density")+ xlab("log10(sum samples abundance)")+
+  geom_vline(xintercept = log10(kegg_tpm_thres), linetype="dashed", color="red")+
+  scale_x_continuous(breaks = seq(1, 10, 1))+
+  scale_color_manual(values=c("black", "#2E7272","#AF8080", "#CEA241"))+
+  theme_classic()
+
+```
+
+The threshold of 0.5 seems appropriate.
+
+## 15.2 Collect info
+
+Now, lets collect the data that we need to represent the ternary plot:
+
+```{r}
+#calculate mean TPM per sample, which will be used to calculate contribution in the ternary space.
+kegg_tpm = as.data.frame(RhizCom$functions$KEGG$tpm) %>% 
+  mutate(AbundTotal = rowSums(.),
+         meanTPM_RhizCom = rowMeans(select(., starts_with("RhizCom"))),
+         meanTPM_Soil = rowMeans(select(., starts_with("Soil"))),
+         meanTPM_SbRB = rowMeans(select(., starts_with("STB")))) %>% 
+  select(meanTPM_RhizCom, meanTPM_Soil, meanTPM_SbRB, AbundTotal) %>%
+  filter(AbundTotal >= 0.5) %>% #apply filt
+  rownames_to_column("KEGG.ID") %>%
+  #add KEGG info
+  left_join(data.frame(KEGGPATH=RhizCom$misc$KEGG_paths) %>% rownames_to_column("KEGG.ID"),
+            by="KEGG.ID")
+
+head(kegg_tpm)
+nrow(kegg_tpm) #sanity check, number should be the same as above.
+```
+
+Convert the meanTPMs to the ternary coordinates.
+
+```{r}
+#Calculate ternary abundance
+kegg_tpm.tern = kegg_tpm %>%
+  group_by(KEGG.ID) %>%
+   # Calculate the total TPM for size
+  mutate(
+    total_TPMs = meanTPM_SbRB + meanTPM_RhizCom + meanTPM_Soil
+  ) %>%
+  # Calculate the % TPM values per sample
+  mutate(
+    SbRB = meanTPM_SbRB/total_TPMs,
+    RhizCom = meanTPM_RhizCom/total_TPMs,
+    Soil = meanTPM_Soil/total_TPMs
+  ) 
+  
+# ---- DEFINE Dominance base don abundance in the ternary space.
+kegg_tpm.tern = kegg_tpm.tern %>% 
+  mutate(Dominance = ifelse(SbRB >= 0.6 & RhizCom <= 0.2 & Soil <= 0.2, "SbRB dominant",
+                            ifelse(SbRB <= 0.2 & RhizCom >= 0.6 & Soil <= 0.2, "RhizCom dominant",
+                                   ifelse(SbRB <= 0.2 & RhizCom <= 0.2 & Soil >= 0.6, "Soil dominant",
+                                          ifelse(SbRB <= 0.2 & RhizCom > 0.2 & Soil > 0.2, "SbRB suppressed",
+                                                 ifelse(SbRB > 0.2 & RhizCom <= 0.2 & Soil > 0.2, "RhizCom suppressed",
+                                                        ifelse(SbRB > 0.2 & RhizCom > 0.2 & Soil <= 0.2, "Soil suppressed", "Balanced")))))))
+
+head(kegg_tpm.tern)
+```
+
+
+## 15.3 Dominance categories based on DAA
+
+We can define the dominance of a function based on the DAA. A function is enriched in a sample if is differentially more abundant in the 2 comparisons that include that sample, or in one bot not significally different in the other two. A function is suppressed in a sample if is differentially less abundant in the comparisons that include that sample. And a function has a balanced distribution when either is not significatnly enriched in any comparison, or doesnt meet any of the above criteria.
+
+Define the dominance categorires based on DAA:
+
+```{r}
+daa.results = read.table("DESeq2/all_results.txt", header = T, sep = "\t", fill = T, quote = "")
+
+daa_dominance = daa.results %>% select(KEGG.ID, condition, diffexpressed) %>%
+  pivot_wider(names_from = condition, values_from = diffexpressed)
+colnames(daa_dominance) = c("KEGG.ID", "Soil_vs_RhizCom", "STB_vs_RhizCom", "Soil_vs_STB")
+
+#create the dominance categories
+daa_dominance <- daa_dominance %>%
+  mutate(
+    enrichment = case_when(
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "Soil" ~ "Soil enriched",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "STB" ~ "SbRB enriched",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "NO" ~ "RhizCom suppressed",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "Soil" ~ "Soil enriched",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "STB" ~ "Balanced",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "NO" ~ "SbRB suppressed",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "Soil" ~ "Soil enriched",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "STB" ~ "RhizCom suppressed",
+      Soil_vs_RhizCom == "Soil" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "NO" ~ "Soil enriched",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "Soil" ~ "Balanced",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "STB" ~ "SbRB enriched",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "NO" ~ "Soil suppressed",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "Soil" ~ "RhizCom enriched",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "STB" ~ "RhizCom enriched",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "NO" ~ "RhizCom enriched",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "Soil" ~ "SbRB suppressed",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "STB" ~ "Soil suppressed",
+      Soil_vs_RhizCom == "RhizCom" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "NO" ~ "RhizCom enriched",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "Soil" ~ "RhizCom suppressed",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "STB" ~ "SbRB enriched",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "STB" & Soil_vs_STB == "NO" ~ "SbRB enriched",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "Soil" ~ "SbRB suppressed",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "STB" ~ "Soil suppressed",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "RhizCom" & Soil_vs_STB == "NO" ~ "RhizCom enriched",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "Soil" ~ "Soil enriched",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "STB" ~ "SbRB enriched",
+      Soil_vs_RhizCom == "NO" & STB_vs_RhizCom == "NO" & Soil_vs_STB == "NO" ~ "Balanced",
+      TRUE ~ "Balanced"))  # Default case, if none of the above conditions are met
+  
+head(daa_dominance)
+```
+
+Now that we have defined the dominance based on differential abundance, we can map this to the ternary dataframe and represent it, with colors according to the dominance.
+**kegg_tpm.tern contains both the Dominance (based on abundance) and the enrichment, based on DAA**
+
+```{r}
+kegg_tpm.ternEnrich = kegg_tpm.tern %>% left_join(daa_dominance %>% select(KEGG.ID, enrichment), by="KEGG.ID") %>%
+  #There might still be cases in which DAA was not calculated for one or more pairwise comparisons. In these cases, return to the Dominance based on abundance defined above.
+  mutate(enrichment = ifelse(is.na(enrichment), Dominance, enrichment)) %>%
+  mutate(enrichment = gsub("dominant", "enriched", enrichment))
+head(kegg_tpm.ternEnrich)
+
+ggtern(data = kegg_tpm.ternEnrich, aes(x = SbRB, y = RhizCom, z = Soil, color=enrichment)) + 
+  geom_point(aes(size=log2(total_TPMs)), alpha=0.5, shape=16) +
+  scale_color_manual(values=c("grey", "#2e7272", "#83b7b6", "#cea241", "#e8c891", "#af8080", "#dbc3c3"), na.value = "red") +
+  theme_bvbw() +
+  theme_nomask() +
+  theme_ticklength(major = unit(3, "mm")) +
+
+ 
+  theme(tern.axis.line.T=element_line(color="black"),
+        tern.axis.line.L=element_line(color="black"),
+        tern.axis.line.R=element_line(color="black"),
+        
+        tern.axis.title = element_text(face = "bold"),
+        
+        tern.axis.title.T = element_text(face = "bold",  color= "#2e7272", vjust=-0.5),
+        tern.axis.title.R = element_text(face = "bold",  color= "#af8080", vjust=-0.5),
+        tern.axis.title.L = element_text(face = "bold",  color= "#cea241", vjust=-0.5),
+        
+        tern.axis.text.T = element_text(color= "black"),
+        tern.axis.text.R = element_text(color= "black"),
+        tern.axis.text.L = element_text(color= "black"),
+        
+        tern.axis.arrow.T = element_line(color="#2e7272"),
+        tern.axis.arrow.R = element_line(color="#af8080"),
+        tern.axis.arrow.L = element_line(color="#cea241"),
+        
+        tern.axis.arrow.text.T = element_text(face = "bold",  color= "#2e7272"),
+        tern.axis.arrow.text.R = element_text(face = "bold",  color= "#af8080"),
+        tern.axis.arrow.text.L = element_text(face = "bold",  color= "#cea241"),
+        
+        tern.panel.grid.major.show = T,
+        tern.panel.grid.major.T = element_line(colour="grey70", linetype = "solid"),
+        tern.panel.grid.major.R = element_line(colour="grey70", linetype = "solid"),
+        tern.panel.grid.major.L = element_line(colour="grey70", linetype = "solid"),
+        
+        
+        tern.axis.ticks.major.T = element_line(size = 2, color="black"),
+        tern.axis.ticks.major.R = element_line(size = 2, color="black"),
+        tern.axis.ticks.major.L = element_line(size = 2, color="black"),
+        legend.key=element_rect(fill=NA),
+        legend.title = element_text(face = "bold"))
+```
+
+A mock representation could be important to visualize how the data is interpreted. The values in the dataframe are cartesian coordinates, which are transformed into ternary coordinates. For example, if we have a datapoint representing 75% in x, 25% in y and 25% in z, (total = 125), this equals to 60, 20 and 20 in a ternary space!
+
+```{r}
+ggtern(data.frame(RhizCom = c(80, 10, 30), Soil = c(10, 50, 60), SbRB = c(10, 75, 35)), 
+       aes(x = SbRB, y = RhizCom, z = Soil)) +
+  geom_point(size=5, alpha=0.5, color=c("orange", "black", "blue"))+ geom_crosshair_tern(lty=2)+
+  theme_bvbw() +
+  theme_nomask() +
+  theme_ticklength(major = unit(3, "mm"))
+```
+
+Counting the number of KEGGs in each Dominance category:
+
+```{r}
+Dominance_count = kegg_tpm.ternEnrich %>% group_by(enrichment) %>% summarise(count = n())
+Dominance_count$x = c(2, 2, 2, 1, 3, 3, 1)
+Dominance_count$y = c(2, 4, 0, 1, 3, 1, 3)
+Dominance_count
+
+ggplot(as.data.frame(Dominance_count), aes(x=x, y = y, size=count, color = enrichment))+
+  geom_point(alpha=0.5, shape=16)+ geom_text(aes(label=count), size=4)+
+  scale_size(range = c(4, 24), name="Count")+
+  scale_color_manual(values=c("grey", "#2e7272", "#83b7b6", "#cea241", "#e8c891", "#af8080", "#dbc3c3")) +
+  scale_y_continuous(labels = label_comma())+
+  theme_void()+ theme(legend.position = "none")+
+  theme_nomask()
+  
+```
+
+
+## 15.4 Dominant functions
+
+We can explore what are the dominant functions in each community.
+
+First process the data:
+
+```{r}
+#separate multiple KEGG annotations
+kegg_tpm.tern.melt = kegg_tpm.ternEnrich %>% separate_rows(KEGGPATH, sep="\\s*\\|\\s*")
+
+#Remove Huamn diseases and organisimal systems (does not apply to our dataset) and paths not available
+kegg_tpm.tern.melt = kegg_tpm.tern.melt %>% 
+  filter(!str_detect(KEGGPATH, "Human Diseases") &
+           !str_detect(KEGGPATH, "Organismal Systems") &
+           !str_detect(KEGGPATH, "path not available") &
+           !str_detect(KEGGPATH, "eukaryotes") &
+           !grepl("Unclassified", KEGGPATH))
+
+#melt the df
+kegg_tpm.tern.melt = kegg_tpm.tern.melt %>% 
+  select(-meanTPM_RhizCom, -meanTPM_SbRB, -meanTPM_Soil, -total_TPMs) %>% reshape2::melt()
+head(kegg_tpm.tern.melt)
+
+
+#Populate hierarchies
+kegg_tpm.tern.melt = kegg_tpm.tern.melt %>%
+  separate(col=KEGGPATH, into=c("PathLv1", "PathLv2", "PathLv3"), sep= "; ", remove=T)
+
+#add count=1; we just want to count the percentage of each category
+kegg_tpm.tern.melt$count = 1
+head(kegg_tpm.tern.melt)
+```
+
+Explore results at the BRITE hierarchy level2:
+
+```{r}
+kegg_tpm.tern.melt.clust = kegg_tpm.tern.melt %>% group_by(PathLv1, PathLv2, PathLv3, Dominance) %>%
+  summarise(Count = n()) %>%
+  group_by(PathLv1, PathLv2, PathLv3,) %>%
+  mutate(Perc = (Count / sum(Count)) * 100) %>%
+  ungroup()
+
+kegg_tpm.tern.melt.clust$ID = paste0(kegg_tpm.tern.melt.clust$PathLv1, ";",
+                                     kegg_tpm.tern.melt.clust$PathLv2, ";",
+                                     kegg_tpm.tern.melt.clust$PathLv3)
+
+#All together - LV1 and 2
+ggplot(kegg_tpm.tern.melt.clust, 
+       aes(y=paste0(PathLv1, " | ", PathLv2), x=Count, fill=Dominance))+
+  geom_bar(position="fill", stat="identity")+
+  scale_fill_manual(values=c("grey", "#2e7272", "#83b7b6", "#cea241", "#e8c891", "#af8080", "#dbc3c3")) +
+  geom_vline(xintercept = 0.5, color="red", linetype="dashed")+
+  theme_pubclean()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        axis.text.y = element_text(hjust=0))
+```
+
+## 15.5 Contribution (TPMs)
+
+We can further explore the relative contribution of each of the categories:
+
+```{r}
+kegg_tpm.ternEnrich_contr = kegg_tpm.ternEnrich %>% filter(KEGG.ID != "Unclassified") %>%
+  select(KEGG.ID, meanTPM_RhizCom, meanTPM_Soil, meanTPM_SbRB, enrichment) %>%
+  reshape2::melt()
+
+kegg_tpm.ternEnrich_contr = kegg_tpm.ternEnrich_contr[kegg_tpm.ternEnrich_contr$variable != 0, ]
+
+#obtain the mean for later:
+kegg_tpm.ternEnrich_contr = kegg_tpm.ternEnrich_contr %>%
+  group_by(enrichment, variable) %>%
+  mutate(mean = mean(value)) %>%
+  group_by(enrichment) %>% mutate(mean_enrich = mean(value))
+
+head(kegg_tpm.ternEnrich_contr)
+
+ggplot(kegg_tpm.ternEnrich_contr, aes(x=variable, y = sqrt(value))) +
+  #geom_jitter(alpha=0.3, shape=16, size=1, width = 0.25, aes(color=variable)) +
+  geom_boxplot(aes(fill=variable), alpha=0.75, outlier.shape = NA) +
+
+  ylim(c(0, 30))+
+  scale_fill_manual(values=c("#2e7272", "#af8080", "#cea241")) +
+  scale_color_manual(values=c("#2e7272", "#af8080", "#cea241")) +
+  xlab("Mean abundance (TPM")+
+  theme_pubclean()+
+  facet_wrap(~enrichment, ncol = 1, switch = "y")+
+  coord_flip()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+## 15.6 Top enriched KEGGs
+
+We can represent the top X enriched functions, for example top 50.
+
+```{r}
+topn = 50
+samples_list = c("RhizCom", "STB", "Soil")
+samp_enrich_list= c("RhizCom enriched", "SbRB enriched", "Soil enriched")
+sample_enrich_mean_list = c("RhizCom_mean", "STB_mean", "Soil_mean")
+kegg_tpm_all = as.data.frame(RhizCom$functions$KEGG$tpm) %>% rownames_to_column("KEGG.ID")
+enriched_plot.list = list()
+n= 0
+cols_list = c("#2e7272", "#cea241", "#af8080")
+
+for (i in samples_list) {
+  n=n+1
+  KEGG_enrich = filter(kegg_tpm.ternEnrich, enrichment == samp_enrich_list[n]) %>% select(KEGG.ID, KEGGPATH)
+  #retrieve per-replicate TPMs
+  KEGG_enrich = KEGG_enrich %>% left_join(kegg_tpm_all, by="KEGG.ID")
+  #calculate mean per sample for sorting and creating table
+  KEGG_enrich = KEGG_enrich %>% group_by(KEGG.ID) %>%
+    summarise(STB1 = sum(STB1), STB2=sum(STB2), STB3=sum(STB3),
+              STB_mean = mean(c(STB1, STB2, STB3)),
+              RhizCom1 = sum(RhizCom1), RhizCom2=sum(RhizCom2), RhizCom3 = sum(RhizCom3),
+              RhizCom_mean = mean(c(RhizCom1, RhizCom2, RhizCom3)),
+              Soil1=sum(Soil1), Soil2=sum(Soil2), Soil3=sum(Soil3),
+              Soil_mean = mean(c(Soil1, Soil2, Soil3)),
+              total_TPMs = sum(STB1, STB2, STB3, RhizCom1, RhizCom2, RhizCom3, Soil1, Soil2, Soil3))
+  
+  #rearrange and get the topn KEGGs
+  KEGG_enrich_top = KEGG_enrich %>%
+    arrange(desc(!!sym(sample_enrich_mean_list[n]))) %>%
+    head(topn) %>%
+    mutate(Order = seq(1:topn)) %>%
+    reshape2::melt(id.vars=c("KEGG.ID", "Order")) %>%
+    mutate(Sample = variable) %>%
+    mutate(Sample = gsub("\\d", "", Sample))
+  
+  #plot
+  enriched_plot.list[[n]] = ggplot(filter(KEGG_enrich_top, Sample==i), 
+                                   aes(y=log10(value), x=reorder(KEGG.ID, Order), fill=Sample)) +
+    geom_bar(stat = "summary", position = "dodge", fun = "mean") +
+    stat_summary(fun.data = "mean_cl_normal", geom = "errorbar", width = 0.4, position = position_dodge(width = 0.9)) +
+    geom_jitter(color="grey20", size = 1.5, shape = 16, alpha=0.75)+
+    xlab("log10(KEGG TPMs)")+
+    scale_fill_manual(values=cols_list[n])+
+    coord_cartesian(ylim=c(2, log10(max(filter(KEGG_enrich_top, Sample==i)$value))))+
+    theme_pubr() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+}
+
+ggarrange(plotlist = enriched_plot.list, common.legend = T, ncol = 1, align = "hv")
+
+```
+
+It might be handy to export this table with enriched, suppressed and balanced categories for manual inspection:
+
+```{r}
+#make table with ALL enriched/balanced/suppressed:
+KEGG_enrich.suppr_all = kegg_tpm.ternEnrich %>% 
+  select(KEGG.ID, KEGGPATH, enrichment) %>%
+  left_join(kegg_tpm_all, by="KEGG.ID")
+#obtain and merge it with GeneName
+orfs_all = as.data.frame(RhizCom$orfs$table) %>% rownames_to_column("orf.ID") %>%
+  filter(Molecule == "CDS") %>%
+  select(orf.ID, `Gene name`, `KEGG ID`, KEGGFUN) %>%
+  setNames(c("orf.ID", "GeneName", "KEGG.ID", "KEGGFUN")) %>%
+  filter(KEGG.ID != "") %>% 
+  separate_rows(KEGG.ID, sep=";") %>%
+  mutate(`KEGG ID` = gsub("\\*", "", KEGG.ID)) #remove asterisks from KEGG identifier
+#Finally, merge all
+
+KEGG_enrich.suppr_all = KEGG_enrich.suppr_all %>% left_join(orfs_all, by = "KEGG.ID") %>%
+  select(-orf.ID, `KEGG ID`) %>% unique()
+
+#write.table(KEGG_enrich.suppr_all, "KEGG_enrich-suppr_ALL_res.txt", sep="\t", quote=F, row.names = F)
+```
+
+## 15.7 RhizCom vs. Soil
+
+As SbRB is mostly integrated into RhizCom, the RhizCom vs. Soil DAA comparison is interesting to explore in more detail, as it contains details of what is important for rhizosphere exploitation.
+
+After manual exploration of the DAA, there are certain KEGGs whose enriched function in either condition are interesting. I have manually subset the RhizCom vs. soil DAA result.
+
+```{r}
+daa_highlights = read.table("DESeq2/DESeq_KEGG_subset.txt", header = T, sep = "\t", quote = "")
+head(daa_highlights)
+
+ggplot(daa_highlights, aes(x=log2FoldChange, y=paste0(Group," | ",gene.group), color=Group))+
+  geom_point(size=1, alpha=0.5, shape=16)+
+  geom_vline(xintercept = c(2.5, -2.5))+
+  geom_text_repel(aes(label=Gene.name), size=1.5, max.overlaps = 55)+  
+  theme_classic2() + theme(strip.background = element_blank(), axis.text = element_text(size=6))
+```
+
+For the representation, there's no need to use a volcano plot, because I have already filtered by padj.
+
+
+#16 Functions to Taxa
+
+Which taxa carries the enriched functions?
+
+
+##17.1 Obtain genes and tax for enriched functions
+
+```{r}
+genes_tax = data.frame(RhizCom$orfs$table) %>% filter(Molecule == "CDS") %>% 
+  rownames_to_column("Gene.ID") %>%
+  select(-Method, -Length.NT, -Length.AA, -Molecule, -GC.perc, -COG.ID, -COGFUN, -COGPATH, -PFAM, -Hits) %>%
+  separate_rows(KEGG.ID, sep = ";")
+
+#remove asterists from Gene.ID
+genes_tax$KEGG.ID = gsub("\\*", "", genes_tax$KEGG.ID)
+
+#add taxonomy and TPMs
+genes_tax = genes_tax %>%
+  left_join(data.frame(RhizCom$orfs$tax) %>% rownames_to_column("Gene.ID"), by="Gene.ID") %>%
+  left_join(data.frame(RhizCom$orfs$tpm) %>% rownames_to_column("Gene.ID"), by="Gene.ID")
+
+head(genes_tax)
+
+```
+
+##17.2 Add enrichment
+
+Next we are going to add the enrichment category per gene based on the KEGG and filer out those without a KEGG category (gene not assigned to KEGG).
+
+```{r}
+genes_tax = genes_tax %>% 
+  left_join(select(kegg_tpm.ternEnrich, KEGG.ID, enrichment), by="KEGG.ID") %>%
+  filter(KEGG.ID != "" | enrichment == "NA")
+
+head(genes_tax)
+```
+
+
+##17.3 Represent enriched functions by taxa
+
+We are going to use the ComplexHeatmap function to plot the KEGGs by enrichment community, taxa and  TPMs.
+
+First, process the data
+
+```{r}
+genes_tax_matrix = genes_tax %>% 
+  mutate(meanTPM_RhizCom = rowMeans(select(., starts_with("RhizCom"))),
+         meanTPM_Soil = rowMeans(select(., starts_with("Soil"))),
+         meanTPM_SbRB = rowMeans(select(., starts_with("STB")))) %>%
+  mutate(family = gsub("\\s\\(no class in NCBI\\)", "", family)) %>%
+  group_by(KEGG.ID, enrichment, family) %>%
+  summarise(meanTPM_RhizCom = sum(meanTPM_RhizCom),
+            meanTPM_Soil = sum(meanTPM_Soil),
+            meanTPM_SbRB = sum(meanTPM_SbRB))
+
+#Add again the KEGGPATH and populate for multiple PATHs per KEGG
+genes_tax_matrix = genes_tax_matrix %>%
+  left_join(data.frame(RhizCom$misc$KEGG_paths) %>% 
+              rownames_to_column("KEGG.ID"), by="KEGG.ID") %>%
+  mutate(KEGGPATH = RhizCom.misc.KEGG_paths) %>% select(-RhizCom.misc.KEGG_paths) %>%
+  separate_rows(KEGGPATH, sep="\\s*\\|\\s*") %>%
+  separate(col=KEGGPATH, into=c("PathLv1", "PathLv2", "PathLv3"), sep= "; ", remove=T) %>%
+  filter(PathLv1 != "Human Diseases" | PathLv1 != "Organismal Systems")
+
+#Add the KEGG ID to the KEGGPATH, and create a global TPMs mean column
+genes_tax_matrix$KEGGPATH = paste0(genes_tax_matrix$PathLv1, "|", genes_tax_matrix$PathLv2,"|", genes_tax_matrix$PathLv3, "|", genes_tax_matrix$KEGG.ID)
+
+#Testing, removing the KEGG ID so it can be grouped by functions.
+genes_tax_matrix$KEGGPATH = paste0(genes_tax_matrix$PathLv1, "|", genes_tax_matrix$PathLv2,"|", genes_tax_matrix$PathLv3)
+head(genes_tax_matrix)
+```
+
+Now, this table is huge and we wont be able to see much if we try to plot it as it is. As we are considering enriched and suppressed functions, one way to reduce this huge table is to divide it by enrichment categories:
+
+Lets see only rhizcom enriched
+
+
+
+
+
+#Enriched at genus level
+
+```{r}
+genes_tax_matrix_gen = genes_tax %>% 
+  mutate(meanTPM_RhizCom = rowMeans(select(., starts_with("RhizCom"))),
+         meanTPM_Soil = rowMeans(select(., starts_with("Soil"))),
+         meanTPM_SbRB = rowMeans(select(., starts_with("STB")))) %>%
+  mutate(Tax = paste0("s_", superkingdom, ";p_", phylum, 
+                      ";c_", class, ";o_", order, 
+                      ";f_", family, ";g_", genus)) %>%
+  select(KEGG.ID, enrichment, Tax, meanTPM_RhizCom, meanTPM_Soil, meanTPM_SbRB)
+
+#Add again the KEGGPATH and populate for multiple PATHs per KEGG
+genes_tax_matrix_gen = genes_tax_matrix_gen %>%
+  left_join(data.frame(RhizCom$misc$KEGG_paths) %>% 
+              rownames_to_column("KEGG.ID"), by="KEGG.ID") %>%
+  mutate(KEGGPATH = RhizCom.misc.KEGG_paths) %>% select(-RhizCom.misc.KEGG_paths) %>%
+  separate_rows(KEGGPATH, sep="\\s*\\|\\s*") %>%
+  separate(col=KEGGPATH, into=c("PathLv1", "PathLv2", "PathLv3"), sep= "; ", remove=T) %>%
+  filter(PathLv1 != "Human Diseases" & PathLv1 != "Organismal Systems") %>%
+  filter(!grepl("not available", PathLv1, ignore.case = TRUE))
+```
+
+The same KEGG.ID can have multiple kEGG paths (same protein can be involved in multiple functions). Therefore, the identifier in this case is actually the combination of the 3 hierarchical lavels of KEGG paths.
+
+```{r}
+#Merge the Pathlevels and transform to long format
+genes_tax_matrix_gen$KEGGPATH = paste0(genes_tax_matrix_gen$PathLv1, "|", 
+                                       genes_tax_matrix_gen$PathLv2,"|", 
+                                       genes_tax_matrix_gen$PathLv3) 
+
+#Group by Taxa and KEGGPATH and add global TPMs as mean value across samples
+genes_tax_gen = genes_tax_matrix_gen %>%
+  group_by(enrichment, Tax, KEGGPATH) %>%
+  summarise(meanTPM_RhizCom = sum(meanTPM_RhizCom),
+            meanTPM_SbRB = sum(meanTPM_SbRB),
+            meanTPM_Soil = sum(meanTPM_Soil)) %>% ungroup() %>%
+  mutate(meanTPMs = rowMeans(select(., c(meanTPM_RhizCom, meanTPM_SbRB, meanTPM_Soil)),  na.rm = TRUE))
+
+head(genes_tax_gen)
+```
+
+For plotting the TPM of each enrichment category instead of the global one, add a dynamic column:
+
+```{r}
+genes_tax_gen = genes_tax_gen %>%
+  mutate(meanTPMs_dynamic = case_when(
+    enrichment == "Balanced" ~ meanTPMs,
+    enrichment == "RhizCom enriched" ~ meanTPM_RhizCom,
+    enrichment == "SbRB enriched" ~ meanTPM_SbRB,
+    enrichment == "Soil enriched" ~ meanTPM_Soil,
+    enrichment == "RhizCom suppressed" ~ meanTPM_RhizCom,
+    enrichment == "SbRB suppressed" ~ meanTPM_SbRB,
+    enrichment == "Soil suppressed" ~ meanTPM_Soil,
+    TRUE ~ NA_real_  # In case there's an unexpected value in `enrichment`
+  ))
+
+head(genes_tax_gen)
+```
+
+
+And plot
+
+```{r}
+ggplot(filter(genes_tax_gen, enrichment %in% c("RhizCom enriched", "SbRB enriched", "Soil enriched")) %>%
+         filter(meanTPMs >= 0.25) %>%
+         filter(!grepl("s_Eukaryota", Tax, ignore.case = TRUE)) %>%
+         filter(!grepl("s_Unclassified", Tax, ignore.case = TRUE)),
+         #filter(!grepl("Unclassified", Tax, ignore.case = TRUE)) %>%
+         #filter(!grepl("in NCBI", Tax, ignore.case = TRUE)), 
+       aes(x = KEGGPATH, y = reorder(Tax, Tax), fill = log10(meanTPMs_dynamic))) +
+  geom_tile() +
+  facet_wrap(~enrichment, ncol = 1, scales = "free_y") +
+  scale_fill_gradient(low = "white", high = "seagreen4", na.value = "grey70") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size=2), 
+        axis.text.y = element_text(size=2))
+
+```
+
+That is the general picture, which is hard to interpret. There are multiple functional categories that mostly (or only) apply to Eukaryota. It will be better to filter these out
+
+```{r}
+#generate list of PathLv3 functions primarily found in eukaryotes:
+eukary_funs = c("Mitochondrial biogenesis", "Proteasome", "Spliceosome", "Ubiquitin system", "Cytokine receptors", "Cytokines and growth factors", "Exosome", "G protein-coupled receptors", "Glycosaminoglycan binding proteins", "Ion channels", "Glycosylphosphatidylinositol (GPI)-anchored proteins", "Proteoglycans", "Apoptosis", "Apoptosis - fly", "Apoptosis - multiple species", "Cell cycle - yeast", "Cellular senescence", "Ferroptosis", "Necroptosis", "Oocyte meiosis", "Meiosis - yeast", "p53 signaling pathway", "Regulation of actin cytoskeleton", "Adherens junction", "Focal adhesion", "Gap junction", "Tight junction", "Signaling pathways regulating pluripotency of stem cells", "Autophagy - animal", "Autophagy - other", "Autophagy - yeast", "Mitophagy - animal", "Mitophagy - yeast", "Endocytosis", "Lysosome", "Peroxisome", "Phagosome", "AMPK signaling pathway", "Apelin signaling pathway", "Calcium signaling pathway", "cAMP signaling pathway", "cGMP-PKG signaling pathway", "ErbB signaling pathway", "FoxO signaling pathway", "Hedgehog signaling pathway", "Hedgehog signaling pathway - fly", "HIF-1 signaling pathway", "Hippo signaling pathway", "Hippo signaling pathway - fly", "Hippo signaling pathway - multiple species", "Jak-STAT signaling pathway", "MAPK signaling pathway", "MAPK signaling pathway - fly", "MAPK signaling pathway - plant", "MAPK signaling pathway - yeast", "mTOR signaling pathway", "NF-kappa B signaling pathway", "Notch signaling pathway", "Phosphatidylinositol signaling system", "Phospholipase D signaling pathway", "PI3K-Akt signaling pathway", "Plant hormone signal transduction", "Rap1 signaling pathway", "Ras signaling pathway", "Sphingolipid signaling pathway", "TGF-beta signaling pathway", "TNF signaling pathway", "VEGF signaling pathway", "Wnt signaling pathway", "Cell adhesion molecules (CAMs)", "Cytokine-cytokine receptor interaction", "ECM-receptor interaction", "Neuroactive ligand-receptor interaction", "Proteasome", "Protein processing in endoplasmic reticulum", "SNARE interactions in vesicular transport", "Ubiquitin mediated proteolysis", "Fanconi anemia pathway", "Basal transcription factors", "Spliceosome", "Ribosome biogenesis in eukaryotes", "RNA transport", "Photosynthesis", "Photosynthesis - antenna proteins", "Glycosaminoglycan biosynthesis - chondroitin sulfate / dermatan sulfate", "Glycosaminoglycan biosynthesis - heparan sulfate / heparin", "Glycosphingolipid biosynthesis - lacto and neolacto series", "Glycosphingolipid biosynthesis - globo and isoglobo series", "Glycosphingolipid biosynthesis - ganglio series", "Glycosylphosphatidylinositol (GPI)-anchor biosynthesis", "N-Glycan biosynthesis", "Cutin, suberine and wax biosynthesis", "Steroid hormone biosynthesis", "Primary and secondary bile acid biosynthesis")
+```
+
+Now filter the dataframe to remove these.
+In addition, we are going to remove taxa classified as superkindom Eukaryota, Archaea, Viruses or unclassified.
+
+```{r}
+#create a regular expression patter with OR for each term:
+pattern = paste(eukary_funs, collapse = "|")
+
+genes_tax_gen_filt = genes_tax_gen %>% 
+  #filter(meanTPMs >= 0.05) %>%
+  filter(!grepl("s_Eukaryota|s_Archaea|s_Unclassified|s_Viruses", Tax, ignore.case = TRUE)) %>%
+  filter(!grepl(pattern, KEGGPATH))
+genes_tax_gen_filt$KEGGPATH = gsub("Brite Hierarchies", "Protein families", 
+                                   genes_tax_gen_filt$KEGGPATH)
+genes_tax_gen_filt$KEGGPATH = gsub("Not Included in Pathway or Brite", 
+                                   "Poorly characterized or unclassified ", genes_tax_gen_filt$KEGGPATH)
+genes_tax_gen_filt$KEGGPATH = gsub("Unclassified: ", "", genes_tax_gen_filt$KEGGPATH)
+
+head(genes_tax_gen_filt)
+```
+
+In the next code we are going to further process the data as follows:
+1. Trasnform into a matrix, being the taxa the rownames, the KEGGPATH the column names, and the meanTPMs_dynamic the values. Order the matrix alphabetically by rows and columns.
+2. From rownmaes and columnames, we are gonna create a list with the phylum and the first 2 levels of KEGGPATH for grouping and coloring.
+3. Plot with ComplexHeatmap
+
+We need to do this in a loop to generate 3 plots for each of the enriched communities:
+
+
+```{r}
+#categories = unique(genes_tax_gen_filt$enrichment)
+categories = c("RhizCom enriched", "SbRB enriched", "Soil enriched")
+
+#identify unique KEGGs across categories to ensure all the plots contain them:
+all_kegg_paths = unique(genes_tax_gen_filt$KEGGPATH)
+
+#Extract unique values for Lv1 and Lv2 KEGG paths and assign colors to ensure consistency across plots
+cols_clust_all = genes_tax_gen_filt %>%
+  distinct(KEGGPATH) %>%
+  separate(KEGGPATH, into = c("Lv1", "Lv2", "Lv3"), sep = "\\|")
+
+
+lv1_colors = structure(c("#415E80", "#D6A570", "#AFAFAF", "#8D935F", "#7B435B", "#0A7F4D"),
+                       names = unique(cols_clust_all$Lv1))
+lv2_colors = structure(c("#1A6862", "#997E64", "#FFD4A9", "#436282", "#AFDBDD", "#7DB2B2", 
+                         "#307F7B", "#898989", "#BCBCBC", "#000000", "#D6A87F", "#A9AD73",
+                         "#84A2BF", "#60163A", "#7A4860", "#9B5C7A", "#777C31", "#0B4F30", 
+                         "#1F774F", "#4E9676", "#8ABAA4", "#022C56", "#254B70", "#6784A0",
+                         "#A8C6E5", "#599997", "#565656", "#DCDDB1"),
+                       names = unique(cols_clust_all$Lv2))
+
+annotation_colors = list(Lv1 = lv1_colors, Lv2 = lv2_colors)
+
+#Extract unique values for phylum and class and assign colors to ensure consistency across ploats
+all_taxa = genes_tax_gen_filt %>%
+  separate(Tax, into = c("superkingdom", "phylum", "class", "order", "family", "genus"), sep = ";") %>%
+  mutate(phylum = str_remove(phylum, "^p_"), class = str_remove(class, "^c_")) %>%
+  distinct(phylum, class)
+
+phylum_palette = colorRampPalette(c("darkred", "yellow", "green", "blue"))(length(unique(all_taxa$phylum)))
+class_palette = colorRampPalette(c("darkblue", "cyan", "magenta", "orange"))(length(unique(all_taxa$class)))
+
+# Create named color vectors
+phylum_colors = structure(phylum_palette, names = unique(all_taxa$phylum))
+class_colors = structure(class_palette, names = unique(all_taxa$class))
+
+taxa_annotation_colors = list(phylum = phylum_colors, class = class_colors)
+
+enrich_maps = list()
+for (i in categories){
+  filt_matr = genes_tax_gen_filt %>%
+    filter(enrichment == i) %>%
+    group_by(Tax, KEGGPATH) %>%
+    summarize(meanTPMs_dynamic = mean(meanTPMs_dynamic), .groups = 'drop') %>%
+    pivot_wider(names_from = KEGGPATH, values_from = meanTPMs_dynamic, values_fill = list(meanTPMs_dynamic = NA)) %>%
+    arrange(Tax) %>% column_to_rownames(var="Tax") %>%
+    select(sort(colnames(.)))
+  
+  #Ensure that all matrices have the same columns
+  missing_cols = setdiff(all_kegg_paths, colnames(filt_matr))
+  if (length(missing_cols) > 0) {
+    filt_matr[missing_cols] = NA
+  }
+  
+  filt_matr = filt_matr %>%
+    select(all_of(all_kegg_paths)) # Select and order columns as per all_kegg_paths
+  
+  #Columns
+  cols_clust = data.frame(KEGGPATH = colnames(filt_matr)) %>%
+    separate(KEGGPATH, into = c("Lv1", "Lv2", "Lv3"), sep = "\\|")
+  rownames(cols_clust) = colnames(filt_matr)
+  
+  #define ordering of columns
+  #cols_clust$Lv1 = factor(cols_clust$Lv1, levels = unique(cols_clust$Lv1[!is.na(cols_clust$Lv1)]))
+  #cols_clust$Lv2 = factor(cols_clust$Lv2, levels = unique(cols_clust$Lv2[!is.na(cols_clust$Lv2)]))
+  #cols_clust$Lv3 = factor(cols_clust$Lv3, levels = unique(cols_clust$Lv3[!is.na(cols_clust$Lv3)]))
+  ordered_cols = order(cols_clust$Lv1, cols_clust$Lv2, cols_clust$Lv3, na.last = TRUE)
+  
+  #Rows
+  rows_clust = data.frame(Tax = rownames(filt_matr)) %>%
+    separate(Tax, into = c("superkingdom", "phylum", "class", "order", "family", "genus"), sep = ";") %>%
+    mutate(
+      superkingdom = str_remove(superkingdom, "^s_"),
+      phylum = str_remove(phylum, "^p_"),
+      class = str_remove(class, "^c_"),
+      order = str_remove(order, "^o_"),
+      family = str_remove(family, "^f_"),
+      genus = str_remove(genus, "^g_"))
+  rownames(rows_clust) = rownames(filt_matr)
+  
+  #define ordering of rows
+  rows_clust$phylum = factor(rows_clust$phylum, levels = unique(rows_clust$phylum[!is.na(rows_clust$phylum)]))
+  rows_clust$class = factor(rows_clust$class, levels = unique(rows_clust$class[!is.na(rows_clust$class)]))
+  rows_clust$genus = factor(rows_clust$genus, levels = unique(rows_clust$genus[!is.na(rows_clust$genus)]))
+  ordered_rows = order(rows_clust$phylum, rows_clust$class, rows_clust$genus, na.last = T)
+  rows_clust = rows_clust %>% arrange(phylum, class, genus)
+  
+  # Replace zeroes with NA and apply log10 transformation
+  filt_matr = filt_matr %>%
+    mutate(across(everything(), ~ replace(., . == 0, NA))) %>%
+    mutate(across(everything(), ~ log2(.)))  # Apply log10 transformation
+  
+  enrich_maps[[i]] = Heatmap(filt_matr, name = paste0("log2(", i,")"),
+                             border = T, row_title = "Tax", column_title = "KEGG PATH", 
+                             cluster_rows = F, cluster_columns = F, 
+                             column_order =  ordered_cols, 
+                             row_order = ordered_rows,
+                             col = colorRamp2(c(-20, 20), c("grey95", "darkgreen")), na_col = "white",
+                             row_labels = rows_clust$genus, 
+                             column_labels = cols_clust$Lv3,
+                             top_annotation = HeatmapAnnotation(df= select(cols_clust, Lv1, Lv2),
+                                                                col = annotation_colors), 
+                             left_annotation = rowAnnotation(df = select(rows_clust, phylum, class),
+                                                             col = taxa_annotation_colors),
+                             column_names_gp = gpar(fontsize = 2),
+                             row_names_gp = gpar(fontsize = 2))
+}
+
+
+enrich_maps$`RhizCom enriched`
+enrich_maps$`SbRB enriched`
+enrich_maps$`Soil enriched`
+```
+
+**Note:** The figures are very big and unless we export them we cannot see what's going on.
+
+
+Obtain a list of the taxa with the most enriched total KEGGs
+
+```{r}
+top_enriched = list()
+
+for (i in categories){
+  top_enriched[[i]] = genes_tax_gen_filt %>%
+    filter(enrichment == i) %>%
+    group_by(Tax, KEGGPATH) %>%
+    summarize(meanTPMs_dynamic = mean(meanTPMs_dynamic), .groups = 'drop') %>%
+    pivot_wider(names_from = KEGGPATH, values_from = meanTPMs_dynamic, values_fill = list(meanTPMs_dynamic = NA)) %>%
+    arrange(Tax) %>% column_to_rownames(var="Tax") %>%
+    select(sort(colnames(.))) %>%
+    as_tibble(rownames = "Tax") %>%  # Convert matrix-like object to tibble and keep row names
+    mutate(Total_TPMs = rowSums(select(., -Tax), na.rm = TRUE)) %>%  # Compute row sums excluding "Tax"
+    select(Tax, Total_TPMs) %>% arrange(desc(Total_TPMs))
+}
+
+head(top_enriched)
+View(top_enriched$`RhizCom enriched`)
+View(top_enriched$`SbRB enriched`)
+View(top_enriched$`Soil enriched`)
+  
+```
+
+End of metagenome analysis.
+
+
+
