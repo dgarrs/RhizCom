@@ -1930,6 +1930,53 @@ ggplot(kegg_tpm.ternEnrich_contr, aes(x=variable, y = sqrt(value))) +
 
 ```
 
+Test for differences between groups:
+
+```{r}
+ggplot(kegg_tpm.ternEnrich_contr, aes(x=variable, y = value,10)) +
+  geom_jitter(alpha=0.3, shape=16, size=1, width = 0.25, aes(color=variable)) +
+  geom_boxplot(aes(fill=variable), alpha=0.75, outlier.shape = NA) +
+  stat_compare_means(comparisons = list(c("meanTPM_SbRB", "meanTPM_Soil"), c("meanTPM_SbRB", "meanTPM_RhizCom"), 
+                                 c("meanTPM_Soil", "meanTPM_RhizCom")),
+              method = "wilcox.test", label = "p.format")+
+  ylim(c(0, 10000))+
+  geom_text(aes(label=round(mean, 2), y=500))+
+  geom_text(aes(label=round(mean_enrich, 2), y= 2000))+
+  scale_fill_manual(values=c("#2e7272", "#af8080", "#cea241")) +
+  scale_color_manual(values=c("#2e7272", "#af8080", "#cea241")) +
+  xlab("Mean abundance (TPM")+
+  theme_pubclean()+
+  facet_wrap(~enrichment)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+#Compare using Kruskal-Wallis, per group
+kw_TPM_results = data.frame()
+
+for (i in unique(kegg_tpm.ternEnrich_contr$enrichment)) {
+  data = filter(kegg_tpm.ternEnrich_contr, enrichment == i)
+  kw_TPMs = agricolae::kruskal(data$value,
+                             paste0(data$enrichment,"-", data$variable),
+                             p.adj = "BH")
+  kw_TPMsres = rownames_to_column(kw_TPMs$groups, var="Group")
+  kw_TPMsres = cbind(kw_TPMsres, kw_TPMs$statistics$p.chisq)
+  kw_TPM_results = rbind(kw_TPM_results, kw_TPMsres)
+}
+
+#write.table(kw_TPM_results, "kruskal-wallis_TPM-KEGGs_dominance.txt", quote = F, sep = "\t", row.names = F)
+
+
+#and all vs. all
+kw_TPMs = agricolae::kruskal(kegg_tpm.ternEnrich_contr$value,
+                             paste0(kegg_tpm.ternEnrich_contr$enrichment,"-", kegg_tpm.ternEnrich_contr$variable),
+                             p.adj = "BH")
+kw_TPMsres = rownames_to_column(kw_TPMs$groups, var="Group")
+kw_TPMsres = cbind(kw_TPMsres, kw_TPMs$means$kegg_tpm.ternEnrich_contr.value, kw_TPMs$statistics$p.chisq)
+
+#write.table(kw_TPMsres, "kruskal-wallis_TPM-KEGGs_dominance_ALLcomparisons.txt", quote = F, sep = "\t", row.names = F)
+
+```
+
 
 ## 15.6 Top enriched KEGGs
 
