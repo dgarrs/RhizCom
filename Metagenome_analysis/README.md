@@ -6,3 +6,5 @@ The R script (.Rmd) for the analysis of the metagenomes of the samples included 
 5. Functional analysis.
 
 In addition, manually generated files "MAGS_info.txt" and "DESeq_KEGG_subset.txt" are provided.
+
+For plotting the nonpareil curves, the "samples_nonpareil.txt" file and the required .npo files are provided under nonpareil directory.
