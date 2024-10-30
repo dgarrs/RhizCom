@@ -1,0 +1,22 @@
+Stats	order	Param	Sample	value
+500	1	contigs	Coassembly	3926246
+1000	2	contigs	Coassembly	1535233
+2000	3	contigs	Coassembly	604715
+5000	4	contigs	Coassembly	181645
+10000	5	contigs	Coassembly	71742
+50000	6	contigs	Coassembly	6606
+100000	7	contigs	Coassembly	2088
+largest contig	15	legnth	Coassembly	3685350
+500	8	legnth	Coassembly	6848589175
+1000	9	legnth	Coassembly	5200683438
+2000	10	legnth	Coassembly	3930439507
+5000	11	legnth	Coassembly	2666591068
+10000	12	legnth	Coassembly	1913636900
+50000	13	legnth	Coassembly	695745529
+1000000	14	legnth	Coassembly	388575902
+GC%	16	Cgperc	Coassembly	62.73
+N50	17	N50	Coassembly	2796
+N90	18	N90	Coassembly	663
+auN	19	auN	Coassembly	27253
+L50	20	L50	Coassembly	388864
+L90	21	L90	Coassembly	2733230
