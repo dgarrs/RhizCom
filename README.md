@@ -6,6 +6,6 @@ Raw 16S rRNA amplicon reads and metagenome sequencing data are available in the 
 
 Files include.
 1. Amplicon sequence analysis: R script, metadata, ASV sequence table, taxonomy table, and CFUs.
-2. Metagenome analyses: R script. 
+2. Metagenome analyses: R script and other required files.
 
 Other data used in the study and processed data can be found in the supplementary material of the paper.
