@@ -1,0 +1,10 @@
+File	Name	Col
+6-S16_1_R1.npo	RhizCom1	"#53A30D"
+6-S16_2_R1.npo	RhizCom2	"#53A30D"
+6-S16_3_R1.npo	RhizCom3	"#53A30D"
+STB1_R1.npo	SbRB1	"#FF6C6C"
+STB2_R1.npo	SbRB2	"#FF6C6C"
+STB3_R1.npo	SbRB3	"#FF6C6C"
+S16_1_nohost.npo	Soil1	"#C49A00"
+S16_2_nohost.npo	Soil2	"#C49A00"
+S16_6_nohost.npo	Soil3	"#C49A00"
