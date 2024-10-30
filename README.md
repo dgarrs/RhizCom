@@ -6,7 +6,7 @@ Raw 16S rRNA amplicon reads and metagenome sequencing data are available in the 
 
 Files include.
 1. Amplicon sequence analysis: R script, metadata, ASV sequence table, taxonomy table, and CFUs.
-2. Metagenome analyses: R script and other required files. A sample data "RhizCom_subset.rds" file is provided to execute the metagenome analyses. The file contains only high-quality bins instead of the full dataset.
+2. Metagenome analyses: R script and other required files. A sample data "RhizCom_subset.rds" file is provided for testing purposes. The file contains only 5 high-quality bins instead of the full dataset.
 
 The code was developed and tested in R (version 4.1.1 or 4.4.1), running on RStudio (version 2024.04.2 Build 764) on a Dell workstation with an Intel(R) Xeon(R) Gold 6248R CPU processor, 384 GB of RAM, and Windows 10 Pro operating system.
 
