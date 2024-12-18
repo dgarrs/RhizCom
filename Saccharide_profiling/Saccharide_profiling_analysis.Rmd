@@ -1,0 +1,107 @@
+---
+title: "Saccharide profile analysis"
+author: "Daniel Garrido-Sanz (daniel.garridosanz@unil.ch)"
+affiliation: "Kell Lab | Department of fundamental microbiology | University of Lausanne"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmdformats::html_clean:
+    code_folding: hide
+    toc: true
+    thumbnails: false
+    toc_depth: 3
+pkgdown:
+  as_is: true
+---
+
+We have selected 5 strains to characterize their ability to use 2 monosacharides (glucose and fructose) and four disacharadies (sucrose, maltose, trehalose and cellobiose). In addition, we have characterized the ability of growin with co-cultured with a Pantoea.
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+```
+
+#0. Load data
+
+```{r}
+cfus = read.table("Saccharide_profile_CFUs.txt", header = T, sep = "\t", quote = "")
+head(cfus)
+```
+
+#1. Check controls.
+
+Check if any controls have growth and remove it not.
+
+```{r}
+if(count(cfus %>% filter(strain_name == "Control" & CFUs_mL != 0)) == 0){
+  print(cfus %>% filter(strain_name == "Control" & CFUs_mL != 0))
+  cfus = cfus %>% filter(strain_name != "Control")
+}else{
+  print(cfus %>% filter(strain_name == "Control" & CFUs_mL != 0))
+}
+
+head(cfus)
+```
+
+#2. Inoculum
+
+Extract CFUs in M9 base media (without carbon sources) and calculate mean values per strain
+
+```{r}
+#plot distribution of inoculum
+ggplot(cfus %>% filter(carbon_sour == "M9_NoCarbon"), aes(x=strain_name, y=log10(CFUs_mL)))+
+  geom_boxplot()+
+  geom_jitter() +
+  ggtitle("Inoculum size")
+
+inoculum = cfus %>% filter(carbon_sour == "M9_NoCarbon") %>% 
+  group_by(strain_name) %>% 
+  summarize(CFUs.mL_M9 = mean(CFUs_mL))
+head(inoculum)
+
+```
+
+#3. Normalize growth
+
+Now we can normalize the growth of each strain by subtracting the M9 base media CFUs.
+
+```{r}
+cfus = cfus %>% left_join(inoculum, by="strain_name") %>%
+  mutate(CFUs.mL_growth = CFUs_mL - CFUs.mL_M9)
+head(cfus)
+```
+
+#4. Plot
+
+
+```{r}
+# Combine the datasets
+cfus_combined = cfus %>%
+  filter(carbon_sour != "M9_NoCarbon") %>%
+  mutate(Experiment_Label = case_when(
+    Experiment == "monoculture" ~ "Monoculture",
+    Experiment == "coculture_SbRB3" ~ "SbRB3 Coculture",
+    Experiment == "coculture_DGS31" ~ "DGS31 Coculture")) %>%
+  group_by(sample_name, strain_name, carbon_sour, Experiment_Label) %>%
+  mutate(mean_CFUs = mean(CFUs.mL_growth, na.rm = TRUE)) %>%
+  ungroup()
+
+# Create the plot
+ggplot(cfus_combined,
+       aes(
+         x = ifelse(Experiment == "monoculture", strain_name,
+                    paste0(gsub("_(.*)", "", sample_name), "-", strain_name)),
+         y = log10(CFUs.mL_growth),
+         fill = carbon_sour)) +
+  geom_col(position = "identity", aes(y=log10(mean_CFUs))) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.5) +
+  geom_jitter(shape = 16, width = 0.2) +
+  coord_cartesian(ylim = c(3, 10)) +
+  scale_fill_manual(values = c("#1b9e77", "#66a61e", "#7570b3", "#e7298a", "#d95f02", "#e6ab02")) +
+  facet_grid(carbon_sour ~ Experiment_Label, scales = "free_x", space = "free_x") +
+  ylab("log10(Norm. CFUs/mL)")+ xlab("Strain")+
+  theme_bw()+
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    panel.spacing = unit(1, "lines"))
+```
