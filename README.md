@@ -1,6 +1,6 @@
 # RhizCom - Rhizosphere Community microbiome assembly during sequential succession
 
-R scripts for the analyses used in Garrido-Sanz, D., Keel, C. Seed-borne bacteria drive wheat rhizosphere microbiome assembly via niche partitioning and facilitation. Nature Microbiology (2025). [https://doi.org/10.1038/s41564-025-01973-1](https://doi.org/10.1101/2024.10.21.619384).
+R scripts for the analyses used in Garrido-Sanz, D., Keel, C. Seed-borne bacteria drive wheat rhizosphere microbiome assembly via niche partitioning and facilitation. Nature Microbiology (2025). [https://doi.org/10.1038/s41564-025-01973-1](https://doi.org/10.1038/s41564-025-01973-1).
 
 Raw 16S rRNA amplicon reads and metagenome sequencing data are available in the NCBI Sequence Read Archive (RSA) under BioProject accession number [PRJNA1169405](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA1169405).
 
